@@ -36,13 +36,14 @@ VAL_RATIO = 0.15
 def load_fold(fold_name):
     """Load images, masks, and types from a single fold."""
     # PanNuke folder structure after extraction:
-    #   fold_1/images/fold1/images.npy
-    #   fold_1/images/fold1/types.npy
-    #   fold_1/masks/fold1/masks.npy
+    #   Fold 1/images/fold1/images.npy
+    #   Fold 1/images/fold1/types.npy
+    #   Fold 1/masks/fold1/masks.npy
     fold_num = fold_name.split("_")[1]
-    img_path = os.path.join(RAW_DIR, fold_name, "images", f"fold{fold_num}", "images.npy")
-    types_path = os.path.join(RAW_DIR, fold_name, "images", f"fold{fold_num}", "types.npy")
-    masks_path = os.path.join(RAW_DIR, fold_name, "masks", f"fold{fold_num}", "masks.npy")
+    folder_name = f"Fold {fold_num}"
+    img_path = os.path.join(RAW_DIR, folder_name, "images", f"fold{fold_num}", "images.npy")
+    types_path = os.path.join(RAW_DIR, folder_name, "images", f"fold{fold_num}", "types.npy")
+    masks_path = os.path.join(RAW_DIR, folder_name, "masks", f"fold{fold_num}", "masks.npy")
 
     print(f"Loading {fold_name}...")
     images = np.load(img_path)

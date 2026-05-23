@@ -1,0 +1,80 @@
+\documentclass[twoside,11pt]{article}
+
+\usepackage{aa228-jmlr2e}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{lipsum}
+\usepackage{listings}
+\usepackage{url}
+\usepackage{cleveref}
+\usepackage{subcaption}
+
+\begin{document}
+
+% More details can be found here: https://aa228.stanford.edu/final-project/
+\title{Classical, CNN, and U-Net-Based Methods for Robust Pan-Cancer Nuclei Segmentation}
+\newcommand{\shorttitle}{RL for Roblox} 
+
+%===========================================
+% Fill in your names and emails
+%===========================================
+
+\maketitle
+
+\section{Problem Statement}
+% Describe the problem you want to solve, your project goals, and what success looks like. Explain why this problem is interesting. Please cite any sources you think might help in our understanding of the problem \citep{Kochenderfer2022}. (1-2 paragraphs)
+
+Nuclei segmentation is a core computer vision task in computational pathology. In cancer histology images, accurately identifying cell nuclei is important because nuclear density, morphology, and spatial organization provide useful visual cues for tumor analysis. However, nuclei segmentation is challenging because histology images contain densely packed cells, overlapping nuclei, staining variation, tissue artifacts, and large differences across tissue types. This project will study pan-cancer nuclei segmentation using the PanNuke dataset \cite{gamper2019pannuke}, which contains 256×256 H\&E histopathology image patches from multiple tissue types with ground-truth nuclei masks. The goal is to implement and compare classical computer vision, simple CNN-based segmentation \cite{lecun2015deep}, and U-Net-based methods \cite{ronneberger2015u} for robust binary nuclei segmentation. Instead of only reporting average segmentation accuracy, this project will also analyze where different methods fail, especially across tissue types and nuclei-density levels.
+
+The central question is: How do classical, CNN, and U-Net-based methods compare for robust nuclei segmentation across diverse cancer histology images? This project is interesting within the CS131 scope because it connects classical image processing methods such as thresholding and watershed segmentation with modern convolutional segmentation networks, then evaluates their robustness on a medically relevant visual recognition problem.
+
+\section*{Proposed Methodology}
+
+The project will use PanNuke histopathology image patches as input. The original multi-class nuclei annotations will be converted into binary masks, where all nuclei types are treated as foreground and non-nuclei pixels are treated as background. We will implement and compare the following methods:
+
+\begin{enumerate}
+    \item \textbf{Classical CV baseline: thresholding + watershed segmentation.}
+    This method will convert RGB H\&E images into grayscale or hematoxylin-like representations, apply thresholding to identify likely nuclei regions, use distance transforms to find seed points, and apply watershed segmentation to separate touching nuclei.
+
+    \item \textbf{Simple fully convolutional CNN baseline.}
+    This model will consist of several convolutional layers that directly predict a $256 \times 256$ binary segmentation mask. It will serve as a weak neural baseline without the encoder-decoder structure or skip connections used by U-Net.
+
+    \item \textbf{Vanilla U-Net.}
+    U-Net will be the main deep learning segmentation model. It is well suited for biomedical segmentation because its encoder captures semantic context while its decoder and skip connections preserve spatial details.
+
+    \item \textbf{Attention U-Net or U-Net++ extension.}
+    If time allows, we will implement an improved U-Net variant to evaluate whether attention gates or denser skip connections improve performance on dense or difficult nuclei regions.
+\end{enumerate}
+
+Models will be evaluated using standard segmentation metrics including Dice coefficient, IoU, precision, and recall. We will also compute cell count error by extracting connected components from predicted masks and comparing predicted nuclei counts against ground truth counts. To study robustness, we will report performance not only on the full test set, but also by: tissue type, best and worst qualitative examples, common failure cases such as merged nuclei, missed faint nuclei, and false positives from staining artifacts.
+
+\section*{Feasibility and Timeline}
+
+This project is feasible within four weeks because PanNuke provides ready-to-use image patches and ground-truth masks, and the image size is small enough for efficient training. YuCheng have access to an HPC environment with NVIDIA L40S GPUs, so training multiple models is computationally realistic. Week 1: Data preparation and baseline setup. Week 2: CNN and U-Net implementation. Week 3: U-Net variant and robustness analysis.
+
+% References
+\bibliography{references}
+
+
+\end{document}
+
+medical_segmentation/
+├── README.md                   # Setup, how to run, brief results summary
+├── data/
+│   ├── raw/                    # PanNuke .npy files (gitignored)
+│   └── processed/              # Binary masks after preprocessing
+├── src/
+│   ├── dataset.py              # PyTorch Dataset + transforms
+│   ├── preprocess.py           # Convert PanNuke → binary masks
+│   ├── classical.py            # Threshold + watershed
+│   ├── cnn_baseline.py         # Simple FCN model
+│   ├── unet.py                 # Vanilla U-Net
+│   ├── train.py                # Training loop (all models)
+│   ├── evaluate.py             # Dice, IoU, cell count error
+│   └── visualize.py            # Plot predictions & failures
+├── notebooks/
+│   └── analysis.ipynb          # EDA, results comparison, figures for report
+├── results/                    # Saved figures & metrics (gitignored)
+├── proposal.txt
+├── requirements.txt
+└── .gitignore

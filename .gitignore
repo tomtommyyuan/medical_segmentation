@@ -1,0 +1,15 @@
+# Data
+data/raw/
+data/processed/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Results
+results/
+*.pth
+
+# OS
+.DS_Store

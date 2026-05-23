@@ -1,9 +1,11 @@
 """
 Preprocess PanNuke: convert to binary masks and create deterministic splits.
 
-Loads all 3 folds from data/raw/, merges them, converts the 6-channel masks
+Loads folds one at a time from data/raw/, converts the 6-channel masks
 into binary (nuclei vs background), and splits deterministically into
 train/val/test (70/15/15).
+
+Memory-efficient: processes and frees each fold before loading the next.
 
 Output structure:
     data/processed/
@@ -32,26 +34,26 @@ TRAIN_RATIO = 0.70
 VAL_RATIO = 0.15
 # TEST_RATIO = 0.15 (remainder)
 
+FOLDS = ["fold_1", "fold_2", "fold_3"]
 
-def load_fold(fold_name):
-    """Load images, masks, and types from a single fold."""
-    # PanNuke folder structure after extraction:
-    #   Fold 1/images/fold1/images.npy
-    #   Fold 1/images/fold1/types.npy
-    #   Fold 1/masks/fold1/masks.npy
+
+def get_fold_paths(fold_name):
+    """Return paths to images, types, masks for a fold."""
     fold_num = fold_name.split("_")[1]
     folder_name = f"Fold {fold_num}"
     img_path = os.path.join(RAW_DIR, folder_name, "images", f"fold{fold_num}", "images.npy")
     types_path = os.path.join(RAW_DIR, folder_name, "images", f"fold{fold_num}", "types.npy")
     masks_path = os.path.join(RAW_DIR, folder_name, "masks", f"fold{fold_num}", "masks.npy")
+    return img_path, types_path, masks_path
 
-    print(f"Loading {fold_name}...")
-    images = np.load(img_path)
-    types = np.load(types_path, allow_pickle=True)
-    masks = np.load(masks_path)
 
-    print(f"  images: {images.shape}, masks: {masks.shape}, types: {types.shape}")
-    return images, masks, types
+def get_fold_size(fold_name):
+    """Get number of samples in a fold without loading the full array."""
+    img_path, _, _ = get_fold_paths(fold_name)
+    images = np.load(img_path, mmap_mode="r")
+    n = images.shape[0]
+    del images
+    return n
 
 
 def masks_to_binary(masks):
@@ -87,36 +89,71 @@ def deterministic_split(n, seed=SEED):
 def main():
     os.makedirs(PROCESSED_DIR, exist_ok=True)
 
-    all_images = []
-    all_masks = []
-    all_types = []
+    # First pass: get total size
+    fold_sizes = []
+    for fold_name in FOLDS:
+        n = get_fold_size(fold_name)
+        fold_sizes.append(n)
+        print(f"{fold_name}: {n} samples")
 
-    for fold_name in ["fold_1", "fold_2", "fold_3"]:
-        images, masks, types = load_fold(fold_name)
-        all_images.append(images)
-        all_masks.append(masks)
-        all_types.append(types)
+    total = sum(fold_sizes)
+    print(f"Total: {total} samples")
 
-    images = np.concatenate(all_images, axis=0)
-    masks = np.concatenate(all_masks, axis=0)
-    types = np.concatenate(all_types, axis=0)
+    # Compute split indices over the full dataset
+    train_idx, val_idx, test_idx = deterministic_split(total)
+    print(f"Split: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
 
-    print(f"\nTotal samples: {len(images)}")
+    # Convert global indices to sets for fast lookup
+    split_indices = {"train": np.sort(train_idx), "val": np.sort(val_idx), "test": np.sort(test_idx)}
 
-    print("Converting masks to binary...")
-    binary_masks = masks_to_binary(masks)
+    # Pre-allocate output arrays
+    split_images = {s: np.zeros((len(idx), 256, 256, 3), dtype=np.uint8) for s, idx in split_indices.items()}
+    split_masks = {s: np.zeros((len(idx), 256, 256), dtype=np.uint8) for s, idx in split_indices.items()}
+    split_types = {s: np.empty(len(idx), dtype=object) for s, idx in split_indices.items()}
 
-    print("Splitting into train/val/test...")
-    train_idx, val_idx, test_idx = deterministic_split(len(images))
-    print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}, Test: {len(test_idx)}")
+    # Track where to insert into each split's output array
+    split_pos = {"train": 0, "val": 0, "test": 0}
 
-    for split_name, idx in [("train", train_idx), ("val", val_idx), ("test", test_idx)]:
-        np.save(os.path.join(PROCESSED_DIR, f"{split_name}_images.npy"), images[idx])
-        np.save(os.path.join(PROCESSED_DIR, f"{split_name}_masks.npy"), binary_masks[idx])
-        np.save(os.path.join(PROCESSED_DIR, f"{split_name}_types.npy"), types[idx])
+    # Build a mapping: for each global index, which split and what position
+    index_to_split = {}
+    for split_name, idx in split_indices.items():
+        for pos, global_idx in enumerate(idx):
+            index_to_split[int(global_idx)] = (split_name, pos)
 
-    print(f"\nSaved to: {os.path.abspath(PROCESSED_DIR)}")
-    print("Files: {train,val,test}_{images,masks,types}.npy")
+    # Second pass: load one fold at a time and distribute samples
+    offset = 0
+    for fold_name, fold_size in zip(FOLDS, fold_sizes):
+        print(f"\nProcessing {fold_name}...")
+        img_path, types_path, masks_path = get_fold_paths(fold_name)
+
+        images = np.load(img_path)
+        types = np.load(types_path, allow_pickle=True)
+        masks = np.load(masks_path)
+
+        print(f"  Converting masks to binary...")
+        binary_masks = masks_to_binary(masks)
+        del masks
+
+        # Place each sample in its split
+        for local_i in range(fold_size):
+            global_i = offset + local_i
+            split_name, pos = index_to_split[global_i]
+            split_images[split_name][pos] = images[local_i]
+            split_masks[split_name][pos] = binary_masks[local_i]
+            split_types[split_name][pos] = types[local_i]
+
+        offset += fold_size
+        del images, binary_masks, types
+
+    # Save
+    print("\nSaving...")
+    for split_name in ["train", "val", "test"]:
+        np.save(os.path.join(PROCESSED_DIR, f"{split_name}_images.npy"), split_images[split_name])
+        np.save(os.path.join(PROCESSED_DIR, f"{split_name}_masks.npy"), split_masks[split_name])
+        np.save(os.path.join(PROCESSED_DIR, f"{split_name}_types.npy"), split_types[split_name])
+        print(f"  {split_name}: {len(split_images[split_name])} samples")
+
+    print(f"\nDone. Saved to: {os.path.abspath(PROCESSED_DIR)}")
 
 
 if __name__ == "__main__":

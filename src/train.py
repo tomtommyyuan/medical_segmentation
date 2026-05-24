@@ -3,14 +3,15 @@ Training script for nuclei segmentation models.
 
 Trains CNN baseline, U-Net, or Attention U-Net on PanNuke binary masks.
 Uses validation set to pick the best checkpoint. Test set is never seen during training.
+Saves every epoch's checkpoint and a CSV history.
 
 Usage:
-    python src/train.py --model unet --epochs 50 --lr 1e-4 --batch_size 16
+    python src/train.py --model unet
     python src/train.py --model cnn
     python src/train.py --model attention_unet
 """
 
-import argparse
+import csv
 import os
 import time
 
@@ -25,6 +26,12 @@ from attention_unet import AttentionUNet
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "processed")
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
+
+# Fixed hyperparameters (same for all models)
+EPOCHS = 25
+LR = 1e-4
+BATCH_SIZE = 32
+NUM_WORKERS = 8
 
 
 class NucleiDataset(Dataset):
@@ -107,72 +114,85 @@ def validate(model, loader, criterion, device):
 
 
 def main():
+    import argparse
     parser = argparse.ArgumentParser(description="Train nuclei segmentation model")
     parser.add_argument("--model", type=str, default="unet", choices=["cnn", "unet", "attention_unet"])
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--patience", type=int, default=10, help="Early stopping patience")
-    parser.add_argument("--num_workers", type=int, default=4)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-    print(f"Model: {args.model}, LR: {args.lr}, Batch: {args.batch_size}, Epochs: {args.epochs}")
+    print(f"[{args.model}] Device: {device}")
+    print(f"[{args.model}] LR: {LR}, Batch: {BATCH_SIZE}, Epochs: {EPOCHS}")
 
     # Data
     train_dataset = NucleiDataset("train")
     val_dataset = NucleiDataset("val")
-    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+    print(f"[{args.model}] Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
 
     # Model, loss, optimizer
     model = get_model(args.model, device)
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
     param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Parameters: {param_count:,}")
+    print(f"[{args.model}] Parameters: {param_count:,}")
 
-    # Training loop
+    # Setup output directories
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    save_path = os.path.join(RESULTS_DIR, f"{args.model}_best.pth")
+    ckpt_dir = os.path.join(RESULTS_DIR, f"{args.model}_checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    csv_path = os.path.join(RESULTS_DIR, f"{args.model}_history.csv")
 
     best_dice = 0.0
     best_epoch = 0
-    patience_counter = 0
 
-    for epoch in range(1, args.epochs + 1):
+    # CSV logger
+    csv_file = open(csv_path, "w", newline="")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(["epoch", "train_loss", "val_loss", "val_dice", "time_s"])
+
+    for epoch in range(1, EPOCHS + 1):
         t0 = time.time()
 
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_loss, val_dice = validate(model, val_loader, criterion, device)
 
         elapsed = time.time() - t0
-        print(f"Epoch {epoch:3d}/{args.epochs} | "
+
+        print(f"[{args.model}] Epoch {epoch:3d}/{EPOCHS} | "
               f"Train Loss: {train_loss:.4f} | "
               f"Val Loss: {val_loss:.4f} | "
               f"Val Dice: {val_dice:.4f} | "
               f"Time: {elapsed:.1f}s")
 
-        # Save best model
+        csv_writer.writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{val_dice:.6f}", f"{elapsed:.1f}"])
+        csv_file.flush()
+
+        # Save every epoch's checkpoint
+        torch.save(model.state_dict(), os.path.join(ckpt_dir, f"epoch_{epoch:02d}.pth"))
+
+        # Track best
         if val_dice > best_dice:
             best_dice = val_dice
             best_epoch = epoch
-            patience_counter = 0
-            torch.save(model.state_dict(), save_path)
-        else:
-            patience_counter += 1
 
-        # Early stopping
-        if patience_counter >= args.patience:
-            print(f"Early stopping at epoch {epoch} (no improvement for {args.patience} epochs)")
-            break
+    csv_file.close()
 
-    print(f"\nBest val Dice: {best_dice:.4f} at epoch {best_epoch}")
-    print(f"Model saved to: {save_path}")
+    # Symlink/copy best checkpoint for easy eval access
+    best_src = os.path.join(ckpt_dir, f"epoch_{best_epoch:02d}.pth")
+    best_dst = os.path.join(RESULTS_DIR, f"{args.model}_best.pth")
+    if os.path.exists(best_dst):
+        os.remove(best_dst)
+    os.symlink(os.path.abspath(best_src), best_dst)
+
+    print(f"\n[{args.model}] Best val Dice: {best_dice:.4f} at epoch {best_epoch}")
+    print(f"[{args.model}] Best checkpoint: {best_src}")
+    print(f"[{args.model}] Symlinked to: {best_dst}")
+    print(f"[{args.model}] All checkpoints: {ckpt_dir}/")
+    print(f"[{args.model}] History: {csv_path}")
 
 
 if __name__ == "__main__":

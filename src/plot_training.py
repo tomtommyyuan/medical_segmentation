@@ -28,13 +28,11 @@ MODELS = ["cnn", "unet"]
 DISPLAY_NAMES = {
     "cnn": "CNN Baseline",
     "unet": "U-Net",
-    "attention_unet": "Attention U-Net",
 }
 
 COLORS = {
     "cnn": "#e74c3c",
     "unet": "#2ecc71",
-    "attention_unet": "#3498db",
 }
 
 
@@ -140,14 +138,14 @@ def plot_summary_bar(outdir):
     metrics_path = os.path.join(RESULTS_DIR, "test_metrics.npy")
     if os.path.exists(metrics_path):
         results = np.load(metrics_path, allow_pickle=True).item()
-        models = list(results.keys())
+        models = [m for m in results.keys() if m != "attention_unet"]
         dice = [results[m]["dice"] for m in models]
         iou = [results[m]["iou"] for m in models]
         display = [DISPLAY_NAMES.get(m, m.title()) for m in models]
     else:
-        display = ["Classical", "CNN", "U-Net", "Attn U-Net"]
-        dice = [0.5447, 0.6953, 0.8281, 0.8280]
-        iou = [0.4093, 0.5628, 0.7220, 0.7229]
+        display = ["Classical", "CNN", "U-Net"]
+        dice = [0.5447, 0.6953, 0.8281]
+        iou = [0.4093, 0.5628, 0.7220]
 
     x = np.arange(len(display))
     width = 0.35

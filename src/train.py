@@ -95,7 +95,11 @@ def validate(model, loader, criterion, device):
     model.eval()
     total_loss = 0.0
     total_dice = 0.0
+    total_precision = 0.0
+    total_recall = 0.0
+    total_cell_error = 0.0
     n_batches = 0
+    smooth = 1e-5
 
     for images, masks in loader:
         images, masks = images.to(device), masks.to(device)
@@ -106,11 +110,34 @@ def validate(model, loader, criterion, device):
 
         total_loss += loss.item() * images.size(0)
         total_dice += dice_score(preds, masks).item()
+
+        # Precision and recall
+        pred_flat = preds.view(preds.size(0), -1)
+        target_flat = masks.view(masks.size(0), -1)
+        intersection = (pred_flat * target_flat).sum(dim=1)
+        precision = ((intersection + smooth) / (pred_flat.sum(dim=1) + smooth)).mean()
+        recall = ((intersection + smooth) / (target_flat.sum(dim=1) + smooth)).mean()
+        total_precision += precision.item()
+        total_recall += recall.item()
+
+        # Cell count MAE via connected components on CPU
+        pred_np = preds.cpu().numpy().squeeze(1).astype(np.uint8)
+        mask_np = masks.cpu().numpy().squeeze(1).astype(np.uint8)
+        from scipy import ndimage
+        for p, m in zip(pred_np, mask_np):
+            pred_count = ndimage.label(p)[1]
+            true_count = ndimage.label(m)[1]
+            total_cell_error += abs(pred_count - true_count)
+
         n_batches += 1
 
-    avg_loss = total_loss / len(loader.dataset)
+    n_samples = len(loader.dataset)
+    avg_loss = total_loss / n_samples
     avg_dice = total_dice / n_batches
-    return avg_loss, avg_dice
+    avg_precision = total_precision / n_batches
+    avg_recall = total_recall / n_batches
+    avg_cell_mae = total_cell_error / n_samples
+    return avg_loss, avg_dice, avg_precision, avg_recall, avg_cell_mae
 
 
 def main():
@@ -152,13 +179,13 @@ def main():
     # CSV logger
     csv_file = open(csv_path, "w", newline="")
     csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(["epoch", "train_loss", "val_loss", "val_dice", "time_s"])
+    csv_writer.writerow(["epoch", "train_loss", "val_loss", "val_dice", "val_precision", "val_recall", "val_cell_mae", "time_s"])
 
     for epoch in range(1, EPOCHS + 1):
         t0 = time.time()
 
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_dice = validate(model, val_loader, criterion, device)
+        val_loss, val_dice, val_prec, val_rec, val_cell_mae = validate(model, val_loader, criterion, device)
 
         elapsed = time.time() - t0
 
@@ -166,9 +193,13 @@ def main():
               f"Train Loss: {train_loss:.4f} | "
               f"Val Loss: {val_loss:.4f} | "
               f"Val Dice: {val_dice:.4f} | "
+              f"Prec: {val_prec:.4f} | "
+              f"Rec: {val_rec:.4f} | "
+              f"Cell MAE: {val_cell_mae:.2f} | "
               f"Time: {elapsed:.1f}s")
 
-        csv_writer.writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{val_dice:.6f}", f"{elapsed:.1f}"])
+        csv_writer.writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{val_dice:.6f}",
+                             f"{val_prec:.6f}", f"{val_rec:.6f}", f"{val_cell_mae:.4f}", f"{elapsed:.1f}"])
         csv_file.flush()
 
         # Save every epoch's checkpoint

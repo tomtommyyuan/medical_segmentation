@@ -51,6 +51,32 @@ def test_hv_map_signs_point_away_from_the_centre():
     assert np.isclose(hv[0, centre_y, 39], 1.0, atol=1e-5)
 
 
+def test_hv_maps_are_exactly_equivariant_to_reflection():
+    # Mirroring a patch must negate the horizontal map exactly. HoVer-Net
+    # rounds the centre of mass to the nearest pixel, which breaks this by up
+    # to 1/6 because a half-integer centroid rounds the other way once
+    # mirrored. Test-time augmentation averages all eight dihedral views, so
+    # that error would show up as views disagreeing with each other.
+    inst, _ = make_patch()
+
+    original = gen_hv_map(inst)
+    mirrored = gen_hv_map(np.ascontiguousarray(inst[:, ::-1]))
+
+    assert np.allclose(mirrored[0], -original[0][:, ::-1], atol=1e-9)
+    assert np.allclose(mirrored[1], original[1][:, ::-1], atol=1e-9)
+
+
+def test_hv_maps_are_exactly_equivariant_to_transposition():
+    inst, _ = make_patch()
+
+    original = gen_hv_map(inst)
+    transposed = gen_hv_map(np.ascontiguousarray(inst.T))
+
+    # Transposing swaps the roles of the two axes.
+    assert np.allclose(transposed[0], original[1].T, atol=1e-9)
+    assert np.allclose(transposed[1], original[0].T, atol=1e-9)
+
+
 def test_hv_map_is_empty_for_an_empty_patch():
     inst = np.zeros((64, 64), dtype=np.int32)
     hv = gen_hv_map(inst)

@@ -62,12 +62,19 @@ def gen_hv_map(inst_map):
         if inst.shape[0] < 2 or inst.shape[1] < 2:
             continue
 
-        com = center_of_mass(inst)
-        com_y = int(com[0] + 0.5)
-        com_x = int(com[1] + 0.5)
+        # The centre of mass is kept as a float. HoVer-Net rounds it to the
+        # nearest pixel, which makes the targets only approximately equivariant
+        # to reflection: mirroring a centroid at a half-integer position rounds
+        # the other way, shifting it a pixel, and because each side is
+        # normalised independently over a ~12px half-width that moves target
+        # values by up to 1/6. Test-time augmentation then averages eight views
+        # that disagree with each other rather than eight views that agree.
+        # Keeping the centroid exact costs nothing and makes the whole dihedral
+        # group exact, which tta.py depends on.
+        com_y, com_x = center_of_mass(inst)
 
-        x_range = np.arange(1, inst.shape[1] + 1) - com_x
-        y_range = np.arange(1, inst.shape[0] + 1) - com_y
+        x_range = np.arange(inst.shape[1], dtype=np.float64) - com_x
+        y_range = np.arange(inst.shape[0], dtype=np.float64) - com_y
         grid_x, grid_y = np.meshgrid(x_range, y_range)
 
         grid_x = grid_x.astype(np.float32)

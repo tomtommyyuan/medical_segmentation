@@ -1,158 +1,185 @@
 """
-Generate qualitative comparison figure for the paper.
+Qualitative comparison figure: instances, not masks.
 
-Picks representative test samples (good, moderate, hard) and plots
-input image, ground truth, and predictions from all four methods
-side by side with per-sample Dice scores.
+Nuclei are drawn with one colour per instance rather than as a white
+foreground, because that is the only way the interesting failure is visible. A
+binary mask of two merged nuclei and a binary mask of two separated nuclei look
+identical; coloured instances show the merge immediately, and the per-panel bPQ
+puts a number on it.
+
+Rows are chosen by CHROMA-Net's per-patch bPQ so the figure spans an easy case,
+a typical one and a hard one rather than three cherry-picked wins.
 
 Usage:
     python src/visualize_qualitative.py
+    python src/visualize_qualitative.py --split 1 --methods unet chroma
 """
 
+import argparse
 import os
-import sys
 
-import numpy as np
-import matplotlib.pyplot as plt
 import matplotlib
+import numpy as np
+import torch
 
 matplotlib.use("Agg")
 
-import torch
-from scipy import ndimage
+import matplotlib.pyplot as plt
+from skimage.color import label2rgb
+from torch.utils.data import DataLoader
 
-sys.path.insert(0, os.path.dirname(__file__))
-
-from cnn_baseline import CNNBaseline
-from unet import UNet
-from attention_unet import AttentionUNet
-from classical import segment_single
+from dataset import SPLITS, NucleiDataset
+from evaluate_instance import load_chroma, predict_binary_baseline, predict_chroma
+from pq_metrics import get_fast_pq
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "processed")
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
 FIGURES_DIR = os.path.join(os.path.dirname(__file__), "..", "figures")
 
+METHOD_LABELS = {
+    "classical": "Classical",
+    "cnn": "CNN",
+    "unet": "U-Net",
+    "attention_unet": "Att. U-Net",
+    "chroma": "CHROMA-Net",
+}
+DEFAULT_METHODS = ["classical", "unet", "chroma"]
 
-def dice_single(pred, target):
-    smooth = 1e-5
-    intersection = (pred * target).sum()
-    return (2.0 * intersection + smooth) / (pred.sum() + target.sum() + smooth)
+ROW_LABELS = ["Easy", "Typical", "Hard"]
 
 
-def predict_single_neural(model, image, device):
-    """Run a single image through a neural model."""
-    batch = image.astype(np.float32) / 255.0
-    batch = np.transpose(batch, (2, 0, 1))[np.newaxis]
-    with torch.no_grad():
-        logits = model(torch.from_numpy(batch).to(device))
-        pred = (torch.sigmoid(logits) > 0.5).cpu().numpy().squeeze().astype(np.uint8)
-    return pred
+def instances_to_rgb(inst_map, seed=0):
+    """Colour an instance map, one hue per nucleus, black background."""
+    if inst_map.max() == 0:
+        return np.zeros(inst_map.shape + (3,), dtype=np.float64)
+
+    rng = np.random.default_rng(seed)
+    colors = rng.uniform(0.35, 1.0, size=(int(inst_map.max()) + 1, 3))
+
+    return label2rgb(inst_map, colors=colors, bg_label=0, bg_color=(0, 0, 0))
+
+
+def pick_rows(scores, n_nuclei, count=3):
+    """
+    Pick an easy, a typical and a hard patch by score.
+
+    Patches with almost no nuclei are skipped: they score extreme values for
+    uninteresting reasons and would waste a row.
+    """
+    eligible = np.where(n_nuclei >= 10)[0]
+    if len(eligible) < count:
+        eligible = np.arange(len(scores))
+
+    order = eligible[np.argsort(scores[eligible])]
+
+    return [order[-1], order[len(order) // 2], order[0]][:count]
 
 
 def main():
-    os.makedirs(FIGURES_DIR, exist_ok=True)
+    parser = argparse.ArgumentParser(description="Qualitative instance comparison figure")
+    parser.add_argument("--methods", type=str, nargs="+", default=DEFAULT_METHODS,
+                        choices=list(METHOD_LABELS))
+    parser.add_argument("--split", type=int, default=1, choices=[1, 2, 3])
+    parser.add_argument("--tag", type=str, default="chroma")
+    parser.add_argument("--tta", action="store_true")
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--data-dir", type=str, default=DATA_DIR)
+    parser.add_argument("--out-dir", type=str, default=RESULTS_DIR)
+    parser.add_argument("--figures-dir", type=str, default=FIGURES_DIR)
+    args = parser.parse_args()
+
+    os.makedirs(args.figures_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    fold = SPLITS[args.split]["test"]
     print(f"Device: {device}")
+    print(f"Split {args.split}, test fold {fold}")
 
-    print("Loading test data...")
-    images = np.load(os.path.join(DATA_DIR, "test_images.npy"))
-    masks = np.load(os.path.join(DATA_DIR, "test_masks.npy"))
-    types = np.load(os.path.join(DATA_DIR, "test_types.npy"), allow_pickle=True)
+    dataset = NucleiDataset(fold, data_dir=args.data_dir, return_instances=True)
+    images = np.asarray(dataset.data["images"])
+    true_inst = np.asarray(dataset.data["insts"]).astype(np.int32)
+    tissues = np.asarray([str(t) for t in dataset.data["tissues"]])
     print(f"Test samples: {len(images)}")
 
-    # Load neural models
-    models = {}
-    for name, cls in [("cnn", CNNBaseline), ("unet", UNet), ("attention_unet", AttentionUNet)]:
-        m = cls()
-        ckpt = os.path.join(RESULTS_DIR, f"{name}_best.pth")
-        m.load_state_dict(torch.load(ckpt, map_location=device, weights_only=True))
-        m.to(device).eval()
-        models[name] = m
+    predictions = {}
+    for method in args.methods:
+        print(f"Predicting with {method}...")
+        if method == "chroma":
+            checkpoint_path = os.path.join(args.out_dir, f"{args.tag}_split{args.split}_best.pth")
+            model, _ = load_chroma(checkpoint_path, device)
+            loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
+                                num_workers=args.workers, pin_memory=True)
+            predictions[method] = predict_chroma(model, loader, device, args.tta)[0]
+        else:
+            predictions[method] = predict_binary_baseline(
+                method, fold, args.data_dir, device, args.split, args.out_dir
+            )[0]
 
-    # Compute per-sample U-Net Dice to pick representative samples
-    print("Computing per-sample Dice for U-Net...")
-    unet_dices = []
-    for i in range(len(images)):
-        pred = predict_single_neural(models["unet"], images[i], device)
-        unet_dices.append(dice_single(pred.astype(np.float64), masks[i].astype(np.float64)))
-    unet_dices = np.array(unet_dices)
+    # Rank patches by the last method's bPQ.
+    reference = args.methods[-1]
+    print(f"Scoring every patch with {reference} to choose rows...")
+    scores = np.array([
+        get_fast_pq(true_inst[i], predictions[reference][i])[0][2]
+        for i in range(len(images))
+    ])
+    n_nuclei = np.array([len(np.unique(t)) - 1 for t in true_inst])
 
-    # Pick samples: high Dice (good), near-median (moderate), low Dice (hard)
-    # Filter out empty masks for the "good" case
-    nonempty = masks.reshape(len(masks), -1).sum(axis=1) > 100
-    valid_dices = np.where(nonempty, unet_dices, -1)
+    rows = pick_rows(scores, n_nuclei)
+    for index, label in zip(rows, ROW_LABELS):
+        print(f"  {label}: idx={index}, tissue={tissues[index]}, "
+              f"nuclei={n_nuclei[index]}, {reference} bPQ={scores[index]:.3f}")
 
-    sorted_idx = np.argsort(valid_dices)
-    good_idx = sorted_idx[-10]  # high Dice, offset a bit from absolute max
-    median_pos = len(sorted_idx) // 2
-    moderate_idx = sorted_idx[median_pos]
-
-    # For hard case, pick from bottom quartile but skip near-empty masks
-    nonempty_low = np.where(nonempty)[0]
-    nonempty_low_dices = unet_dices[nonempty_low]
-    hard_candidates = nonempty_low[np.argsort(nonempty_low_dices)]
-    hard_idx = hard_candidates[5]  # a few from the bottom
-
-    sample_indices = [good_idx, moderate_idx, hard_idx]
-    sample_labels = ["Good", "Moderate", "Challenging"]
-    print(f"Selected indices: {sample_indices}")
-    for i, (idx, label) in enumerate(zip(sample_indices, sample_labels)):
-        print(f"  {label}: idx={idx}, tissue={types[idx]}, U-Net Dice={unet_dices[idx]:.4f}")
-
-    # Generate predictions for selected samples
-    method_names = ["Classical", "CNN", "U-Net", "Att. U-Net"]
-    method_keys = ["classical", "cnn", "unet", "attention_unet"]
-
-    fig, axes = plt.subplots(
-        len(sample_indices), 6,
-        figsize=(18, 3 * len(sample_indices)),
-        gridspec_kw={"wspace": 0.05, "hspace": 0.25},
+    n_columns = 2 + len(args.methods)
+    figure, axes = plt.subplots(
+        len(rows), n_columns,
+        figsize=(2.7 * n_columns, 2.9 * len(rows)),
+        gridspec_kw={"wspace": 0.04, "hspace": 0.12},
+        squeeze=False,
     )
 
-    for row, (idx, label) in enumerate(zip(sample_indices, sample_labels)):
-        image = images[idx]
-        gt = masks[idx]
+    for row, (index, row_label) in enumerate(zip(rows, ROW_LABELS)):
+        axes[row][0].imshow(images[index])
+        axes[row][0].set_ylabel(f"{row_label}\n{tissues[index]}\n{n_nuclei[index]} nuclei",
+                                fontsize=9, rotation=0, labelpad=42, va="center")
 
-        # Input image
-        axes[row, 0].imshow(image)
-        axes[row, 0].set_title("Input" if row == 0 else "", fontsize=11)
-        axes[row, 0].set_ylabel(f"{label}\n({types[idx]})", fontsize=10, rotation=0, labelpad=70, va="center")
+        axes[row][1].imshow(instances_to_rgb(true_inst[index]))
 
-        # Ground truth
-        axes[row, 1].imshow(gt, cmap="gray", vmin=0, vmax=1)
-        axes[row, 1].set_title("Ground Truth" if row == 0 else "", fontsize=11)
+        for column, method in enumerate(args.methods, start=2):
+            pred = predictions[method][index]
+            axes[row][column].imshow(instances_to_rgb(pred))
 
-        # Each method's prediction
-        for col, (mname, mkey) in enumerate(zip(method_names, method_keys)):
-            if mkey == "classical":
-                pred = segment_single(image)
-            else:
-                pred = predict_single_neural(models[mkey], image, device)
-
-            d = dice_single(pred.astype(np.float64), gt.astype(np.float64))
-
-            axes[row, col + 2].imshow(pred, cmap="gray", vmin=0, vmax=1)
-            title = f"{mname}" if row == 0 else ""
-            axes[row, col + 2].set_title(title, fontsize=11)
-            axes[row, col + 2].text(
-                128, 245, f"Dice: {d:.3f}",
-                ha="center", va="bottom", fontsize=9,
-                color="white", fontweight="bold",
-                bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.7),
+            bpq = get_fast_pq(true_inst[index], pred)[0][2]
+            found = len(np.unique(pred)) - 1
+            axes[row][column].text(
+                0.5, 0.02, f"bPQ {bpq:.3f}   {found} found",
+                transform=axes[row][column].transAxes,
+                ha="center", va="bottom", fontsize=8, color="white",
+                bbox=dict(boxstyle="round,pad=0.25", facecolor="black", alpha=0.65,
+                          edgecolor="none"),
             )
+
+        if row == 0:
+            axes[row][0].set_title("H&E patch", fontsize=11)
+            axes[row][1].set_title("Ground truth", fontsize=11)
+            for column, method in enumerate(args.methods, start=2):
+                axes[row][column].set_title(METHOD_LABELS[method], fontsize=11)
 
     for ax in axes.ravel():
         ax.set_xticks([])
         ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
 
-    fig.suptitle("Qualitative Comparison on Test Samples", fontsize=14, fontweight="bold", y=1.0)
-    plt.tight_layout()
+    figure.suptitle("Nuclei instances, one colour per nucleus",
+                    fontsize=13, fontweight="bold", y=0.995)
+    figure.tight_layout()
 
-    out_path = os.path.join(FIGURES_DIR, "qualitative_comparison.png")
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    out_path = os.path.join(args.figures_dir, "qualitative_instances.png")
+    figure.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(figure)
+
     print(f"\nSaved to: {out_path}")
-    plt.close(fig)
 
 
 if __name__ == "__main__":

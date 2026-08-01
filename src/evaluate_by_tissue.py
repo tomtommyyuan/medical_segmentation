@@ -1,197 +1,213 @@
 """
-Evaluate Dice score for all four methods broken down by tissue type.
+Per-tissue bPQ for every method, and the figure that goes with it.
 
-Picks the 5 most common tissue types in the test set for statistical
-reliability, computes per-sample Dice, and reports mean ± std per group.
-Also saves a grouped bar chart to figures/.
+Cross-tissue variance is the axis the stain consistency term is meant to move,
+so it gets its own figure. Every method is scored on the same metric: binary
+panoptic quality on the official test folds. The binary baselines get instances
+from connected components, which is the best they can do without distance maps.
+
+Reporting one metric for all methods matters. The earlier version of this
+script plotted per-tissue Dice, which the binary baselines can score well on
+while merging every touching nucleus, so it flattered exactly the failure the
+project is about.
 
 Usage:
     python src/evaluate_by_tissue.py
+    python src/evaluate_by_tissue.py --splits 1 --methods unet chroma
 """
 
+import argparse
+import json
 import os
-import sys
 
+import matplotlib
 import numpy as np
 import torch
-import matplotlib
-import matplotlib.pyplot as plt
 
 matplotlib.use("Agg")
 
-sys.path.insert(0, os.path.dirname(__file__))
+import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader
 
-from cnn_baseline import CNNBaseline
-from unet import UNet
-from attention_unet import AttentionUNet
-from classical import segment_single
+from dataset import SPLITS, NucleiDataset
+from evaluate_instance import (
+    load_chroma,
+    predict_binary_baseline,
+    predict_chroma,
+    score_fold,
+)
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "processed")
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
 FIGURES_DIR = os.path.join(os.path.dirname(__file__), "..", "figures")
 
-METHOD_NAMES = ["Classical", "CNN", "U-Net", "Att. U-Net"]
-METHOD_KEYS = ["classical", "cnn", "unet", "attention_unet"]
-NUM_TISSUE_TYPES = 5
+METHOD_LABELS = {
+    "classical": "Classical",
+    "cnn": "CNN",
+    "unet": "U-Net",
+    "attention_unet": "Att. U-Net",
+    "chroma": "CHROMA-Net",
+}
+DEFAULT_METHODS = ["classical", "cnn", "unet", "attention_unet", "chroma"]
+
+# Okabe-Ito hues in fixed order, checked for colour-vision deficiency
+# separation (worst adjacent pair dE 11.0 deutan). Assigned by method, never
+# cycled, so a method keeps its colour when the set being plotted changes.
+METHOD_COLORS = {
+    "classical": "#0072B2",
+    "cnn": "#D55E00",
+    "unet": "#009E73",
+    "attention_unet": "#E69F00",
+    "chroma": "#CC79A7",
+}
 
 
-def dice_per_sample(preds, targets):
-    """Compute per-sample Dice scores."""
-    smooth = 1e-5
-    p = preds.reshape(preds.shape[0], -1).astype(np.float64)
-    t = targets.reshape(targets.shape[0], -1).astype(np.float64)
-    intersection = (p * t).sum(axis=1)
-    return (2.0 * intersection + smooth) / (p.sum(axis=1) + t.sum(axis=1) + smooth)
+def score_method(method, split, args, device):
+    """Per-tissue bPQ for one method on one split's test fold."""
+    fold = SPLITS[split]["test"]
+
+    dataset = NucleiDataset(fold, data_dir=args.data_dir, return_instances=True)
+    true_inst = np.asarray(dataset.data["insts"]).astype(np.int32)
+    true_type = np.asarray(dataset.data["types"])
+    tissues = np.asarray([str(t) for t in dataset.data["tissues"]])
+
+    if method == "chroma":
+        checkpoint_path = os.path.join(args.out_dir, f"{args.tag}_split{split}_best.pth")
+        model, _ = load_chroma(checkpoint_path, device)
+        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
+                            num_workers=args.workers, pin_memory=True)
+        pred_inst, pred_type = predict_chroma(model, loader, device, args.tta)
+    else:
+        pred_inst, pred_type = predict_binary_baseline(
+            method, fold, args.data_dir, device, split, args.out_dir
+        )
+
+    return score_fold(pred_inst, pred_type, true_inst, true_type, tissues)
 
 
-def predict_neural(model_name, images, device):
-    """Run batch inference with a trained neural model."""
-    model_map = {"cnn": CNNBaseline, "unet": UNet, "attention_unet": AttentionUNet}
-    model = model_map[model_name]()
+def plot_by_tissue(table, tissues, methods, out_path):
+    """
+    Horizontal grouped bars, one row per tissue, sorted by the best method.
 
-    ckpt = os.path.join(RESULTS_DIR, f"{model_name}_best.pth")
-    model.load_state_dict(torch.load(ckpt, map_location=device, weights_only=True))
-    model.to(device).eval()
+    Horizontal rather than vertical because 19 tissue names do not fit on an x
+    axis without rotating them, and rotated labels are harder to scan than the
+    values they label.
+    """
+    positions = np.arange(len(tissues))
+    height = 0.8 / len(methods)
 
-    batch_size = 32
-    all_preds = []
+    figure, axes = plt.subplots(figsize=(9, 0.55 * len(tissues) + 1.6))
 
-    with torch.no_grad():
-        for i in range(0, len(images), batch_size):
-            batch = images[i : i + batch_size].astype(np.float32) / 255.0
-            batch = np.transpose(batch, (0, 3, 1, 2))
-            logits = model(torch.from_numpy(batch).to(device))
-            preds = (torch.sigmoid(logits) > 0.5).cpu().numpy().squeeze(1).astype(np.uint8)
-            all_preds.append(preds)
+    for i, method in enumerate(methods):
+        values = [table[method][tissue] for tissue in tissues]
+        offset = (i - (len(methods) - 1) / 2) * height
 
-    return np.concatenate(all_preds, axis=0)
+        axes.barh(positions + offset, values, height * 0.9,
+                  label=METHOD_LABELS[method], color=METHOD_COLORS[method],
+                  edgecolor="white", linewidth=0.5)
 
+        # Direct labels on the leading method only. A number on all 95 bars is
+        # noise, and one series labelled is enough to read the scale.
+        if method == methods[-1]:
+            for y, value in zip(positions + offset, values):
+                if np.isfinite(value):
+                    axes.text(value + 0.008, y, f"{value:.2f}", va="center",
+                              fontsize=7, color="#444444")
 
-def predict_classical(images):
-    """Run classical pipeline on all images."""
-    preds = np.zeros((len(images), images.shape[1], images.shape[2]), dtype=np.uint8)
-    for i in range(len(images)):
-        preds[i] = segment_single(images[i])
-    return preds
+    axes.set_yticks(positions)
+    axes.set_yticklabels(tissues, fontsize=9)
+    axes.set_xlabel("Binary Panoptic Quality (bPQ)", fontsize=11)
+    axes.set_xlim(0, 1.0)
+    axes.set_title("Per-tissue instance segmentation quality", fontsize=13, fontweight="bold")
+    axes.legend(fontsize=9, loc="lower right", frameon=False)
+
+    axes.grid(axis="x", alpha=0.25, linewidth=0.6)
+    axes.set_axisbelow(True)
+    axes.spines["top"].set_visible(False)
+    axes.spines["right"].set_visible(False)
+    axes.spines["left"].set_visible(False)
+    axes.tick_params(left=False)
+
+    figure.tight_layout()
+    figure.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(figure)
 
 
 def main():
-    os.makedirs(FIGURES_DIR, exist_ok=True)
+    parser = argparse.ArgumentParser(description="Per-tissue bPQ across methods")
+    parser.add_argument("--methods", type=str, nargs="+", default=DEFAULT_METHODS,
+                        choices=DEFAULT_METHODS)
+    parser.add_argument("--splits", type=int, nargs="+", default=[1, 2, 3], choices=[1, 2, 3])
+    parser.add_argument("--tag", type=str, default="chroma")
+    parser.add_argument("--tta", action="store_true")
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--data-dir", type=str, default=DATA_DIR)
+    parser.add_argument("--out-dir", type=str, default=RESULTS_DIR)
+    parser.add_argument("--figures-dir", type=str, default=FIGURES_DIR)
+    args = parser.parse_args()
+
+    os.makedirs(args.figures_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    print(f"Methods: {args.methods}, splits: {args.splits}")
 
-    print("Loading test data...")
-    images = np.load(os.path.join(DATA_DIR, "test_images.npy"))
-    masks = np.load(os.path.join(DATA_DIR, "test_masks.npy"))
-    types = np.load(os.path.join(DATA_DIR, "test_types.npy"), allow_pickle=True)
-    print(f"Test samples: {len(images)}")
+    # table[method][tissue] = bPQ averaged over the evaluated splits
+    table = {}
+    for method in args.methods:
+        print(f"\nScoring {method}...")
+        per_split = [score_method(method, split, args, device) for split in args.splits]
 
-    # Find the most common tissue types
-    unique_types, counts = np.unique(types, return_counts=True)
-    sorted_idx = np.argsort(-counts)
-    top_types = unique_types[sorted_idx[:NUM_TISSUE_TYPES]]
-    top_counts = counts[sorted_idx[:NUM_TISSUE_TYPES]]
+        tissue_scores = {}
+        for tissue in sorted({t for r in per_split for t in r["per_tissue"]}):
+            values = [r["per_tissue"][tissue]["bpq"] for r in per_split
+                      if tissue in r["per_tissue"]]
+            tissue_scores[tissue] = float(np.nanmean(values))
 
-    print(f"\nTop {NUM_TISSUE_TYPES} tissue types in test set:")
-    for t, c in zip(top_types, top_counts):
-        print(f"  {t}: {c} samples")
+        table[method] = tissue_scores
+        overall = float(np.nanmean(list(tissue_scores.values())))
+        spread = float(np.nanstd(list(tissue_scores.values())))
+        print(f"  bPQ {overall:.4f}, across-tissue std {spread:.4f}")
 
-    # Generate predictions for each method
-    print("\nGenerating predictions...")
-    all_preds = {}
-    for key in METHOD_KEYS:
-        print(f"  {key}...")
-        if key == "classical":
-            all_preds[key] = predict_classical(images)
-        else:
-            all_preds[key] = predict_neural(key, images, device)
+    # Sort tissues by the last method's score so the figure reads as a ranking.
+    reference = args.methods[-1]
+    tissues = sorted(table[reference], key=lambda t: table[reference][t])
 
-    # Compute per-sample Dice for each method
-    all_dice = {}
-    for key in METHOD_KEYS:
-        all_dice[key] = dice_per_sample(all_preds[key], masks)
-
-    # Build results table: tissue type x method
-    print(f"\n{'='*90}")
-    print(f"  DICE SCORE BY TISSUE TYPE")
-    print(f"{'='*90}")
-    header = f"  {'Tissue Type':<16} {'N':>5}"
-    for name in METHOD_NAMES:
-        header += f"  {name:>16}"
+    print(f"\n{'=' * 80}")
+    print("  bPQ BY TISSUE TYPE")
+    print(f"{'=' * 80}")
+    header = f"  {'Tissue':<18}"
+    for method in args.methods:
+        header += f"{METHOD_LABELS[method]:>14}"
     print(header)
-    print(f"  {'-'*16} {'-'*5}" + f"  {'-'*16}" * len(METHOD_NAMES))
+    print(f"  {'-' * 18}" + f"{'-' * 14}" * len(args.methods))
 
-    # Store for plotting
-    table_means = {key: [] for key in METHOD_KEYS}
-    table_stds = {key: [] for key in METHOD_KEYS}
-    tissue_labels = []
-
-    for tissue in top_types:
-        idx = types == tissue
-        n = idx.sum()
-        tissue_labels.append(tissue)
-
-        row = f"  {tissue:<16} {n:>5}"
-        for key, name in zip(METHOD_KEYS, METHOD_NAMES):
-            d = all_dice[key][idx]
-            mean, std = d.mean(), d.std()
-            table_means[key].append(mean)
-            table_stds[key].append(std)
-            row += f"  {mean:>6.3f} ± {std:.3f}"
+    for tissue in tissues:
+        row = f"  {tissue:<18}"
+        for method in args.methods:
+            row += f"{table[method][tissue]:>14.4f}"
         print(row)
 
-    # Overall row
-    print(f"  {'-'*16} {'-'*5}" + f"  {'-'*16}" * len(METHOD_NAMES))
-    row = f"  {'Overall':<16} {len(images):>5}"
-    for key in METHOD_KEYS:
-        d = all_dice[key]
-        row += f"  {d.mean():>6.3f} ± {d.std():.3f}"
+    print(f"  {'-' * 18}" + f"{'-' * 14}" * len(args.methods))
+    row = f"  {'Mean':<18}"
+    spread_row = f"  {'Std across tissue':<18}"
+    for method in args.methods:
+        values = list(table[method].values())
+        row += f"{np.nanmean(values):>14.4f}"
+        spread_row += f"{np.nanstd(values):>14.4f}"
     print(row)
+    print(spread_row)
 
-    # Save results as .npy
-    results = {
-        "tissue_types": tissue_labels,
-        "methods": METHOD_KEYS,
-        "method_names": METHOD_NAMES,
-        "means": {k: np.array(v) for k, v in table_means.items()},
-        "stds": {k: np.array(v) for k, v in table_stds.items()},
-    }
-    results_path = os.path.join(RESULTS_DIR, "tissue_type_dice.npy")
-    np.save(results_path, results)
-    print(f"\nResults saved to: {results_path}")
+    figure_path = os.path.join(args.figures_dir, "bpq_by_tissue.png")
+    plot_by_tissue(table, tissues, args.methods, figure_path)
+    print(f"\nFigure saved to: {figure_path}")
 
-    # Grouped bar chart
-    x = np.arange(len(tissue_labels))
-    width = 0.18
-    colors = ["#ff6b6b", "#ffa94d", "#51cf66", "#339af0"]
-
-    fig, ax = plt.subplots(figsize=(12, 5))
-
-    for i, (key, name, color) in enumerate(zip(METHOD_KEYS, METHOD_NAMES, colors)):
-        means = table_means[key]
-        stds = table_stds[key]
-        offset = (i - 1.5) * width
-        bars = ax.bar(x + offset, means, width, yerr=stds, label=name,
-                      color=color, edgecolor="white", linewidth=0.5,
-                      capsize=3, error_kw={"linewidth": 1})
-
-    ax.set_xlabel("Tissue Type", fontsize=12)
-    ax.set_ylabel("Dice Score", fontsize=12)
-    ax.set_title("Dice Score by Tissue Type Across Methods", fontsize=14, fontweight="bold")
-    ax.set_xticks(x)
-    ax.set_xticklabels(tissue_labels, fontsize=10)
-    ax.set_ylim(0, 1.05)
-    ax.legend(fontsize=10, loc="lower right")
-    ax.grid(axis="y", alpha=0.3)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-
-    plt.tight_layout()
-    fig_path = os.path.join(FIGURES_DIR, "dice_by_tissue.png")
-    fig.savefig(fig_path, dpi=200, bbox_inches="tight")
-    print(f"Figure saved to: {fig_path}")
-    plt.close(fig)
+    results_path = os.path.join(args.out_dir, "tissue_bpq.json")
+    os.makedirs(args.out_dir, exist_ok=True)
+    with open(results_path, "w") as handle:
+        json.dump(table, handle, indent=2)
+    print(f"Results saved to: {results_path}")
 
 
 if __name__ == "__main__":

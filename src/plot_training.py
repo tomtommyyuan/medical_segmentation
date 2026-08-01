@@ -1,233 +1,218 @@
 """
-Plot training curves for all neural models from CSV history files.
+Plot training curves and the final benchmark comparison.
 
-Generates a 2x2 figure with:
-  - Top-left: Train & Val Loss
-  - Top-right: Val Dice
-  - Bottom-left: Val Precision
-  - Bottom-right: Val Recall
+Deliberately imports nothing heavier than matplotlib, so curves can be plotted
+on a login node while jobs are still running on the GPU nodes.
 
-Classical baseline is shown as a horizontal reference line where applicable
-(it has no training history, only test-set metrics).
+Three panels, one metric each. The baselines are selected on Dice and
+CHROMA-Net on mPQ, and those do not belong on shared axes, so they get separate
+panels rather than a second y-axis.
 
 Usage:
     python src/plot_training.py
-    python src/plot_training.py --outdir results/figures
+    python src/plot_training.py --splits 1 --figures-dir figures
 """
 
 import argparse
 import csv
+import glob
+import json
 import os
 
+import matplotlib
 import numpy as np
+
+matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 
-plt.style.use("seaborn-v0_8-whitegrid")
-
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
+FIGURES_DIR = os.path.join(os.path.dirname(__file__), "..", "figures")
 
-MODELS = ["cnn", "unet", "attention_unet"]
+BASELINES = ["cnn", "unet", "attention_unet"]
 
 DISPLAY_NAMES = {
-    "cnn": "CNN Baseline",
+    "classical": "Classical",
+    "cnn": "CNN",
     "unet": "U-Net",
     "attention_unet": "Att. U-Net",
-    "classical": "Classical",
+    "chroma": "CHROMA-Net",
 }
 
-COLORS = {
-    "cnn": "#e74c3c",
-    "unet": "#2ecc71",
-    "attention_unet": "#3498db",
-    "classical": "#9b59b6",
-}
-
-CLASSICAL_TEST_METRICS = {
-    "dice": 0.5447,
-    "precision": 0.4917,
-    "recall": 0.7942,
-    "cell_mae": 21.66,
+# Okabe-Ito hues in fixed order, checked for colour-vision deficiency
+# separation. Kept in step with evaluate_by_tissue.py; a method keeps its
+# colour across every figure in the repo.
+METHOD_COLORS = {
+    "classical": "#0072B2",
+    "cnn": "#D55E00",
+    "unet": "#009E73",
+    "attention_unet": "#E69F00",
+    "chroma": "#CC79A7",
 }
 
 
-def load_history(model_name):
-    """Load training history from CSV."""
-    csv_path = os.path.join(RESULTS_DIR, f"{model_name}_history.csv")
-    data = {"epoch": [], "train_loss": [], "val_loss": [], "val_dice": [],
-            "val_precision": [], "val_recall": [], "val_cell_mae": []}
+def load_history(path):
+    """Read a training history CSV into a dict of float columns."""
+    with open(path) as handle:
+        rows = list(csv.DictReader(handle))
 
-    with open(csv_path) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            data["epoch"].append(int(row["epoch"]))
-            data["train_loss"].append(float(row["train_loss"]))
-            data["val_loss"].append(float(row["val_loss"]))
-            data["val_dice"].append(float(row["val_dice"]))
-            data["val_precision"].append(float(row["val_precision"]))
-            data["val_recall"].append(float(row["val_recall"]))
-            data["val_cell_mae"].append(float(row["val_cell_mae"]))
+    if not rows:
+        return {}
 
-    return data
+    return {key: np.array([float(row[key]) for row in rows]) for key in rows[0]}
 
 
-def add_classical_hline(ax, metric_key, label=True):
-    """Add a horizontal dashed line for the classical baseline's test metric."""
-    if metric_key in CLASSICAL_TEST_METRICS:
-        lbl = DISPLAY_NAMES["classical"] if label else None
-        ax.axhline(y=CLASSICAL_TEST_METRICS[metric_key], color=COLORS["classical"],
-                   linewidth=1.5, linestyle=":", alpha=0.8, label=lbl)
+def find_histories(results_dir, splits):
+    """Locate every history CSV, keyed by (method, split)."""
+    histories = {}
+
+    for path in sorted(glob.glob(os.path.join(results_dir, "*_history.csv"))):
+        name = os.path.basename(path)[: -len("_history.csv")]
+        if "_split" not in name:
+            continue
+
+        method, _, split_text = name.rpartition("_split")
+        if not split_text.isdigit() or int(split_text) not in splits:
+            continue
+
+        histories[(method, int(split_text))] = load_history(path)
+
+    return histories
 
 
-def plot_training_curves(all_data, outdir):
-    """2x2 subplot: loss, dice, precision, recall for all models."""
-    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+def plot_curves(histories, out_path):
+    """Loss, baseline Dice, and CHROMA-Net mPQ, one metric per panel."""
+    figure, axes = plt.subplots(1, 3, figsize=(16, 4.6))
 
-    # Top-left: Loss (no classical reference — it has no loss)
-    ax = axes[0, 0]
-    for name, data in all_data.items():
-        ax.plot(data["epoch"], data["train_loss"],
-                label=f"{DISPLAY_NAMES[name]} (train)", color=COLORS[name], linewidth=2)
-        ax.plot(data["epoch"], data["val_loss"],
-                label=f"{DISPLAY_NAMES[name]} (val)", color=COLORS[name], linewidth=2, linestyle="--")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("BCE Loss")
-    ax.set_title("Training & Validation Loss")
-    ax.legend(fontsize=8, ncol=2)
+    for (method, split), data in sorted(histories.items()):
+        if not data:
+            continue
 
-    # Top-right: Dice
-    ax = axes[0, 1]
-    for name, data in all_data.items():
-        ax.plot(data["epoch"], data["val_dice"],
-                label=DISPLAY_NAMES[name], color=COLORS[name], linewidth=2, marker="o", markersize=3)
-    add_classical_hline(ax, "dice")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Dice Score")
-    ax.set_title("Validation Dice")
-    ax.legend(fontsize=9)
-    ax.set_ylim(0.45, 0.9)
+        color = METHOD_COLORS.get(method, "#888888")
+        label = f"{DISPLAY_NAMES.get(method, method)} s{split}"
 
-    # Bottom-left: Precision
-    ax = axes[1, 0]
-    for name, data in all_data.items():
-        ax.plot(data["epoch"], data["val_precision"],
-                label=DISPLAY_NAMES[name], color=COLORS[name], linewidth=2, marker="s", markersize=3)
-    add_classical_hline(ax, "precision")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Precision")
-    ax.set_title("Validation Precision")
-    ax.legend(fontsize=9)
-    ax.set_ylim(0.4, 0.95)
+        axes[0].plot(data["epoch"], data["train_loss"], color=color, linewidth=1.6,
+                     alpha=0.85, label=f"{label} train")
+        axes[0].plot(data["epoch"], data["val_loss"], color=color, linewidth=1.6,
+                     alpha=0.85, linestyle="--", label=f"{label} val")
 
-    # Bottom-right: Recall
-    ax = axes[1, 1]
-    for name, data in all_data.items():
-        ax.plot(data["epoch"], data["val_recall"],
-                label=DISPLAY_NAMES[name], color=COLORS[name], linewidth=2, marker="^", markersize=3)
-    add_classical_hline(ax, "recall")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Recall")
-    ax.set_title("Validation Recall")
-    ax.legend(fontsize=9)
-    ax.set_ylim(0.45, 1.0)
+        if "val_dice" in data:
+            axes[1].plot(data["epoch"], data["val_dice"], color=color, linewidth=1.8,
+                         label=label)
+        if "val_mpq" in data:
+            axes[2].plot(data["epoch"], data["val_mpq"], color=color, linewidth=1.8,
+                         label=f"{label} mPQ")
+            axes[2].plot(data["epoch"], data["val_bpq"], color=color, linewidth=1.8,
+                         linestyle="--", alpha=0.7, label=f"{label} bPQ")
 
-    fig.suptitle("Training Curves: All Models", fontsize=14, fontweight="bold")
-    plt.tight_layout()
-    path = os.path.join(outdir, "training_curves.png")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved: {path}")
+    axes[0].set_ylabel("Loss")
+    axes[0].set_title("Training and validation loss", fontsize=12, fontweight="bold")
+
+    axes[1].set_ylabel("Dice")
+    axes[1].set_title("Baseline validation Dice", fontsize=12, fontweight="bold")
+
+    axes[2].set_ylabel("Panoptic quality")
+    axes[2].set_title("CHROMA-Net validation PQ", fontsize=12, fontweight="bold")
+
+    for ax in axes:
+        ax.set_xlabel("Epoch")
+        ax.grid(alpha=0.25, linewidth=0.6)
+        ax.set_axisbelow(True)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=7, frameon=False, ncol=1)
+
+    figure.tight_layout()
+    figure.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(figure)
+    print(f"Saved: {out_path}")
 
 
-def plot_cell_mae(all_data, outdir):
-    """Separate plot for cell count MAE over epochs."""
-    fig, ax = plt.subplots(figsize=(9, 5))
+def plot_benchmark(results_dir, out_path):
+    """
+    Final mPQ and bPQ per method, against the published results.
 
-    for name, data in all_data.items():
-        ax.plot(data["epoch"], data["val_cell_mae"],
-                label=DISPLAY_NAMES[name], color=COLORS[name], linewidth=2, marker="D", markersize=4)
+    Reads whatever evaluate_instance.py has written, so the figure only ever
+    shows numbers that were actually measured.
+    """
+    measured = {}
+    for path in sorted(glob.glob(os.path.join(results_dir, "*_instance_metrics.json"))):
+        with open(path) as handle:
+            summary = json.load(handle)
+        measured[summary["name"]] = (summary["mpq"], summary["bpq"])
 
-    add_classical_hline(ax, "cell_mae")
-    ax.set_xlabel("Epoch", fontsize=12)
-    ax.set_ylabel("Cell Count MAE", fontsize=12)
-    ax.set_title("Validation Cell Count Error Over Training", fontsize=14)
-    ax.legend(fontsize=11)
+    if not measured:
+        print("No *_instance_metrics.json found; run evaluate_instance.py first.")
+        return
 
-    plt.tight_layout()
-    path = os.path.join(outdir, "cell_mae_curves.png")
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    print(f"Saved: {path}")
+    published = [
+        ("HoVer-Net", 0.4629, 0.6596),
+        ("CellViT-SAM-H", 0.4980, 0.6793),
+        ("LKCell-L", 0.5080, 0.6851),
+    ]
 
+    names = [p[0] for p in published] + list(measured)
+    mpq = [p[1] for p in published] + [v[0] for v in measured.values()]
+    bpq = [p[2] for p in published] + [v[1] for v in measured.values()]
+    is_ours = [False] * len(published) + [True] * len(measured)
 
-def plot_summary_bar(outdir):
-    """Bar chart comparing final test metrics for all 4 models."""
-    all_models = ["classical", "cnn", "unet", "attention_unet"]
+    positions = np.arange(len(names))
+    width = 0.38
 
-    metrics_path = os.path.join(RESULTS_DIR, "test_metrics.npy")
-    if os.path.exists(metrics_path):
-        results = np.load(metrics_path, allow_pickle=True).item()
-        models = [m for m in all_models if m in results]
-        dice = [results[m]["dice"] for m in models]
-        iou = [results[m]["iou"] for m in models]
-    else:
-        models = all_models
-        dice = [0.5447, 0.6953, 0.8281, 0.8280]
-        iou = [0.4093, 0.5628, 0.7220, 0.7229]
+    figure, axes = plt.subplots(figsize=(1.5 * len(names) + 3, 5))
 
-    display = [DISPLAY_NAMES.get(m, m.title()) for m in models]
+    for offset, values, label, color in [
+        (-width / 2, mpq, "mPQ", "#0072B2"),
+        (width / 2, bpq, "bPQ", "#E69F00"),
+    ]:
+        bars = axes.bar(positions + offset, values, width * 0.92, label=label,
+                        color=color, edgecolor="white", linewidth=0.6)
+        # Published rows are drawn hollow so the measured ones read as the
+        # contribution rather than sitting anonymously in the same row.
+        for bar, ours in zip(bars, is_ours):
+            if not ours:
+                bar.set_alpha(0.45)
+        for bar, value in zip(bars, values):
+            axes.text(bar.get_x() + bar.get_width() / 2, value + 0.008, f"{value:.3f}",
+                      ha="center", va="bottom", fontsize=8, color="#444444")
 
-    x = np.arange(len(display))
-    width = 0.35
+    axes.set_xticks(positions)
+    axes.set_xticklabels(names, fontsize=9, rotation=15, ha="right")
+    axes.set_ylabel("Panoptic quality")
+    axes.set_ylim(0, max(max(mpq), max(bpq)) * 1.2)
+    axes.set_title("PanNuke, official three-fold protocol (solid: this repo)",
+                   fontsize=12, fontweight="bold")
+    axes.legend(fontsize=10, frameon=False)
+    axes.grid(axis="y", alpha=0.25, linewidth=0.6)
+    axes.set_axisbelow(True)
+    axes.spines["top"].set_visible(False)
+    axes.spines["right"].set_visible(False)
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    bars1 = ax.bar(x - width / 2, dice, width, label="Dice", color="#2ecc71", alpha=0.85)
-    bars2 = ax.bar(x + width / 2, iou, width, label="IoU", color="#3498db", alpha=0.85)
-
-    ax.set_ylabel("Score", fontsize=12)
-    ax.set_title("Test Set Performance Comparison", fontsize=14)
-    ax.set_xticks(x)
-    ax.set_xticklabels(display, fontsize=11)
-    ax.legend(fontsize=11)
-    ax.set_ylim(0, 1.0)
-
-    for bar in bars1 + bars2:
-        height = bar.get_height()
-        ax.annotate(f"{height:.3f}", xy=(bar.get_x() + bar.get_width() / 2, height),
-                    xytext=(0, 3), textcoords="offset points", ha="center", fontsize=9)
-
-    plt.tight_layout()
-    path = os.path.join(outdir, "test_comparison.png")
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    print(f"Saved: {path}")
+    figure.tight_layout()
+    figure.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(figure)
+    print(f"Saved: {out_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--outdir", default="results/figures")
+    parser = argparse.ArgumentParser(description="Plot training curves and benchmark comparison")
+    parser.add_argument("--splits", type=int, nargs="+", default=[1, 2, 3], choices=[1, 2, 3])
+    parser.add_argument("--results-dir", type=str, default=RESULTS_DIR)
+    parser.add_argument("--figures-dir", type=str, default=FIGURES_DIR)
     args = parser.parse_args()
 
-    os.makedirs(args.outdir, exist_ok=True)
+    os.makedirs(args.figures_dir, exist_ok=True)
 
-    # Load CSV histories
-    all_data = {}
-    for name in MODELS:
-        csv_path = os.path.join(RESULTS_DIR, f"{name}_history.csv")
-        if os.path.exists(csv_path):
-            all_data[name] = load_history(name)
-            print(f"Loaded {name}: {len(all_data[name]['epoch'])} epochs")
-        else:
-            print(f"WARNING: {csv_path} not found, skipping {name}")
-
-    if not all_data:
+    histories = find_histories(args.results_dir, args.splits)
+    if histories:
+        for (method, split), data in sorted(histories.items()):
+            print(f"Loaded {method} split {split}: {len(data.get('epoch', []))} epochs")
+        plot_curves(histories, os.path.join(args.figures_dir, "training_curves.png"))
+    else:
         print("No history CSVs found. Run training first.")
-        return
 
-    plot_training_curves(all_data, args.outdir)
-    plot_cell_mae(all_data, args.outdir)
-    plot_summary_bar(args.outdir)
-
-    print(f"\nDone! All plots saved to: {args.outdir}")
+    plot_benchmark(args.results_dir, os.path.join(args.figures_dir, "benchmark_comparison.png"))
 
 
 if __name__ == "__main__":

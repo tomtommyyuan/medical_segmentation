@@ -1,105 +1,117 @@
 """
-Training script for nuclei segmentation models.
+Train a binary-mask baseline on one split of the official PanNuke protocol.
 
-Trains CNN baseline, U-Net, or Attention U-Net on PanNuke binary masks.
-Uses validation set to pick the best checkpoint. Test set is never seen during training.
-Saves every epoch's checkpoint and a CSV history.
+Trains the classical-era baselines (simple CNN, U-Net, Attention U-Net) that
+CHROMA-Net is measured against. They predict a binary nuclei mask only, so they
+are scored with Dice and IoU here and with connected-component bPQ in
+evaluate_instance.py, where the cost of having no instance or class output
+shows up directly.
+
+These are kept as a fair ladder rather than a straw man: they get the same
+folds, the same dihedral and stain augmentation, the same cosine schedule and
+the same early-stopping-free budget as CHROMA-Net. Use --no-augment to
+reproduce the original no-augmentation runs.
+
+Run all three splits so the numbers are comparable to everything else:
+    python src/train.py --model unet --split 1
+    python src/train.py --model unet --split 2
+    python src/train.py --model unet --split 3
 
 Usage:
-    python src/train.py --model unet
-    python src/train.py --model cnn
-    python src/train.py --model attention_unet
+    python src/train.py --model unet --split 1
+    python src/train.py --model cnn --split 1 --no-augment
+    python src/train.py --model attention_unet --split 1
 """
 
+import argparse
 import csv
+import json
+import math
 import os
+import random
 import time
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 
-from cnn_baseline import CNNBaseline
-from unet import UNet
 from attention_unet import AttentionUNet
+from cnn_baseline import CNNBaseline
+from dataset import SPLITS, BinaryDataset
+from unet import UNet
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "processed")
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
 
-# Fixed hyperparameters (same for all models)
-EPOCHS = 25
+EPOCHS = 50
 LR = 1e-4
 BATCH_SIZE = 32
 NUM_WORKERS = 8
+WARMUP_EPOCHS = 2
+
+MODELS = {"cnn": CNNBaseline, "unet": UNet, "attention_unet": AttentionUNet}
 
 
-class NucleiDataset(Dataset):
-    def __init__(self, split="train"):
-        self.images = np.load(os.path.join(DATA_DIR, f"{split}_images.npy"))
-        self.masks = np.load(os.path.join(DATA_DIR, f"{split}_masks.npy"))
-
-    def __len__(self):
-        return len(self.images)
-
-    def __getitem__(self, idx):
-        image = self.images[idx].astype(np.float32) / 255.0
-        mask = self.masks[idx].astype(np.float32)
-
-        # (H, W, C) -> (C, H, W)
-        image = np.transpose(image, (2, 0, 1))
-
-        return torch.from_numpy(image), torch.from_numpy(mask).unsqueeze(0)
+def set_seed(seed):
+    """Seed every generator that affects a run."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
-def dice_score(pred, target, smooth=1e-5):
-    """Compute Dice coefficient for a batch of predictions."""
-    pred_flat = pred.view(pred.size(0), -1)
-    target_flat = target.view(target.size(0), -1)
-    intersection = (pred_flat * target_flat).sum(dim=1)
-    return ((2.0 * intersection + smooth) / (pred_flat.sum(dim=1) + target_flat.sum(dim=1) + smooth)).mean()
+def cosine_schedule(optimizer, warmup_steps, total_steps):
+    """Linear warmup then cosine decay, stepped per optimizer step."""
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return (step + 1) / max(warmup_steps, 1)
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def get_model(model_name, device):
-    if model_name == "cnn":
-        model = CNNBaseline()
-    elif model_name == "unet":
-        model = UNet()
-    elif model_name == "attention_unet":
-        model = AttentionUNet()
-    else:
-        raise ValueError(f"Unknown model: {model_name}")
-    return model.to(device)
-
-
-def train_one_epoch(model, loader, criterion, optimizer, device):
+def train_one_epoch(model, loader, criterion, optimizer, scheduler, device):
     model.train()
     total_loss = 0.0
+    n_samples = 0
 
     for images, masks in loader:
         images, masks = images.to(device), masks.to(device)
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         logits = model(images)
         loss = criterion(logits, masks)
         loss.backward()
         optimizer.step()
+        scheduler.step()
 
-        total_loss += loss.item() * images.size(0)
+        total_loss += float(loss.detach()) * images.size(0)
+        n_samples += images.size(0)
 
-    return total_loss / len(loader.dataset)
+    return total_loss / max(n_samples, 1)
 
 
 @torch.no_grad()
 def validate(model, loader, criterion, device):
+    """
+    Validation loss and aggregate segmentation metrics.
+
+    Dice, IoU, precision and recall are accumulated over the whole fold and
+    divided once at the end, rather than averaged per patch. The previous
+    version averaged a per-patch Dice with a 1e-5 smoothing term, which handed
+    every patch containing no nuclei a free 1.0 and inflated the score by an
+    amount that depended on how many empty patches a fold happened to hold.
+    """
     model.eval()
+
     total_loss = 0.0
-    total_dice = 0.0
-    total_precision = 0.0
-    total_recall = 0.0
-    total_cell_error = 0.0
-    n_batches = 0
-    smooth = 1e-5
+    n_samples = 0
+    intersection = 0.0
+    pred_total = 0.0
+    target_total = 0.0
 
     for images, masks in loader:
         images, masks = images.to(device), masks.to(device)
@@ -108,122 +120,134 @@ def validate(model, loader, criterion, device):
         loss = criterion(logits, masks)
         preds = (torch.sigmoid(logits) > 0.5).float()
 
-        total_loss += loss.item() * images.size(0)
-        total_dice += dice_score(preds, masks).item()
+        total_loss += float(loss) * images.size(0)
+        n_samples += images.size(0)
 
-        # Precision and recall
-        pred_flat = preds.view(preds.size(0), -1)
-        target_flat = masks.view(masks.size(0), -1)
-        intersection = (pred_flat * target_flat).sum(dim=1)
-        precision = ((intersection + smooth) / (pred_flat.sum(dim=1) + smooth)).mean()
-        recall = ((intersection + smooth) / (target_flat.sum(dim=1) + smooth)).mean()
-        total_precision += precision.item()
-        total_recall += recall.item()
+        intersection += float((preds * masks).sum())
+        pred_total += float(preds.sum())
+        target_total += float(masks.sum())
 
-        # Cell count MAE via connected components on CPU
-        pred_np = preds.cpu().numpy().squeeze(1).astype(np.uint8)
-        mask_np = masks.cpu().numpy().squeeze(1).astype(np.uint8)
-        from scipy import ndimage
-        for p, m in zip(pred_np, mask_np):
-            pred_count = ndimage.label(p)[1]
-            true_count = ndimage.label(m)[1]
-            total_cell_error += abs(pred_count - true_count)
+    dice = 2.0 * intersection / max(pred_total + target_total, 1.0)
+    iou = intersection / max(pred_total + target_total - intersection, 1.0)
+    precision = intersection / max(pred_total, 1.0)
+    recall = intersection / max(target_total, 1.0)
 
-        n_batches += 1
-
-    n_samples = len(loader.dataset)
-    avg_loss = total_loss / n_samples
-    avg_dice = total_dice / n_batches
-    avg_precision = total_precision / n_batches
-    avg_recall = total_recall / n_batches
-    avg_cell_mae = total_cell_error / n_samples
-    return avg_loss, avg_dice, avg_precision, avg_recall, avg_cell_mae
+    return {
+        "loss": total_loss / max(n_samples, 1),
+        "dice": dice,
+        "iou": iou,
+        "precision": precision,
+        "recall": recall,
+    }
 
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="Train nuclei segmentation model")
-    parser.add_argument("--model", type=str, default="unet", choices=["cnn", "unet", "attention_unet"])
+    parser = argparse.ArgumentParser(description="Train a binary nuclei baseline")
+    parser.add_argument("--model", type=str, default="unet", choices=sorted(MODELS))
+    parser.add_argument("--split", type=int, default=1, choices=[1, 2, 3])
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument("--lr", type=float, default=LR)
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--workers", type=int, default=NUM_WORKERS)
+    parser.add_argument("--warmup-epochs", type=int, default=WARMUP_EPOCHS)
+    parser.add_argument("--no-augment", action="store_true",
+                        help="reproduce the original runs, which had no augmentation")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--data-dir", type=str, default=DATA_DIR)
+    parser.add_argument("--out-dir", type=str, default=RESULTS_DIR)
     args = parser.parse_args()
 
+    set_seed(args.seed)
+
+    run = f"{args.model}_split{args.split}"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[{args.model}] Device: {device}")
-    print(f"[{args.model}] LR: {LR}, Batch: {BATCH_SIZE}, Epochs: {EPOCHS}")
 
-    # Data
-    train_dataset = NucleiDataset("train")
-    val_dataset = NucleiDataset("val")
-    print(f"[{args.model}] Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+    folds = SPLITS[args.split]
+    print(f"[{run}] Device: {device}")
+    print(f"[{run}] Folds: train={folds['train']} val={folds['val']} test={folds['test']}")
+    print(f"[{run}] LR: {args.lr}, Batch: {args.batch_size}, Epochs: {args.epochs}, "
+          f"Augment: {not args.no_augment}")
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+    train_dataset = BinaryDataset(folds["train"], data_dir=args.data_dir,
+                                  augment=not args.no_augment, seed=args.seed)
+    val_dataset = BinaryDataset(folds["val"], data_dir=args.data_dir, seed=args.seed)
+    print(f"[{run}] Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
-    # Model, loss, optimizer
-    model = get_model(args.model, device)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                              num_workers=args.workers, pin_memory=True, drop_last=True,
+                              persistent_workers=args.workers > 0)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
+                            num_workers=args.workers, pin_memory=True,
+                            persistent_workers=args.workers > 0)
+
+    model = MODELS[args.model]().to(device)
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    steps_per_epoch = len(train_loader)
+    scheduler = cosine_schedule(optimizer, args.warmup_epochs * steps_per_epoch,
+                                args.epochs * steps_per_epoch)
 
     param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[{args.model}] Parameters: {param_count:,}")
+    print(f"[{run}] Parameters: {param_count:,}")
 
-    # Setup output directories
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    ckpt_dir = os.path.join(RESULTS_DIR, f"{args.model}_checkpoints")
+    os.makedirs(args.out_dir, exist_ok=True)
+    ckpt_dir = os.path.join(args.out_dir, f"{run}_checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    csv_path = os.path.join(RESULTS_DIR, f"{args.model}_history.csv")
+    with open(os.path.join(args.out_dir, f"{run}_config.json"), "w") as handle:
+        json.dump(vars(args), handle, indent=2)
 
-    best_dice = 0.0
-    best_epoch = 0
-
-    # CSV logger
+    csv_path = os.path.join(args.out_dir, f"{run}_history.csv")
     csv_file = open(csv_path, "w", newline="")
     csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(["epoch", "train_loss", "val_loss", "val_dice", "val_precision", "val_recall", "val_cell_mae", "time_s"])
+    csv_writer.writerow(["epoch", "train_loss", "val_loss", "val_dice", "val_iou",
+                         "val_precision", "val_recall", "lr", "time_s"])
 
-    for epoch in range(1, EPOCHS + 1):
-        t0 = time.time()
+    # Starts below zero so the first epoch always writes a checkpoint. Starting
+    # at 0.0 leaves a run whose Dice never rises above zero with no checkpoint
+    # at all, and evaluation then fails on a missing file rather than on a bad
+    # score.
+    best_dice = -1.0
+    best_epoch = 0
 
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_dice, val_prec, val_rec, val_cell_mae = validate(model, val_loader, criterion, device)
+    for epoch in range(1, args.epochs + 1):
+        start = time.time()
 
-        elapsed = time.time() - t0
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer,
+                                     scheduler, device)
+        metrics = validate(model, val_loader, criterion, device)
 
-        print(f"[{args.model}] Epoch {epoch:3d}/{EPOCHS} | "
+        elapsed = time.time() - start
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        print(f"[{run}] Epoch {epoch:3d}/{args.epochs} | "
               f"Train Loss: {train_loss:.4f} | "
-              f"Val Loss: {val_loss:.4f} | "
-              f"Val Dice: {val_dice:.4f} | "
-              f"Prec: {val_prec:.4f} | "
-              f"Rec: {val_rec:.4f} | "
-              f"Cell MAE: {val_cell_mae:.2f} | "
+              f"Val Loss: {metrics['loss']:.4f} | "
+              f"Val Dice: {metrics['dice']:.4f} | "
+              f"IoU: {metrics['iou']:.4f} | "
+              f"Prec: {metrics['precision']:.4f} | "
+              f"Rec: {metrics['recall']:.4f} | "
               f"Time: {elapsed:.1f}s")
 
-        csv_writer.writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{val_dice:.6f}",
-                             f"{val_prec:.6f}", f"{val_rec:.6f}", f"{val_cell_mae:.4f}", f"{elapsed:.1f}"])
+        csv_writer.writerow([epoch, f"{train_loss:.6f}", f"{metrics['loss']:.6f}",
+                             f"{metrics['dice']:.6f}", f"{metrics['iou']:.6f}",
+                             f"{metrics['precision']:.6f}", f"{metrics['recall']:.6f}",
+                             f"{current_lr:.3e}", f"{elapsed:.1f}"])
         csv_file.flush()
 
-        # Save every epoch's checkpoint
-        torch.save(model.state_dict(), os.path.join(ckpt_dir, f"epoch_{epoch:02d}.pth"))
-
-        # Track best
-        if val_dice > best_dice:
-            best_dice = val_dice
+        if metrics["dice"] > best_dice:
+            best_dice = metrics["dice"]
             best_epoch = epoch
+            torch.save(model.state_dict(), os.path.join(args.out_dir, f"{run}_best.pth"))
+
+        torch.save(model.state_dict(), os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pth"))
 
     csv_file.close()
 
-    # Symlink/copy best checkpoint for easy eval access
-    best_src = os.path.join(ckpt_dir, f"epoch_{best_epoch:02d}.pth")
-    best_dst = os.path.join(RESULTS_DIR, f"{args.model}_best.pth")
-    if os.path.exists(best_dst):
-        os.remove(best_dst)
-    os.symlink(os.path.abspath(best_src), best_dst)
-
-    print(f"\n[{args.model}] Best val Dice: {best_dice:.4f} at epoch {best_epoch}")
-    print(f"[{args.model}] Best checkpoint: {best_src}")
-    print(f"[{args.model}] Symlinked to: {best_dst}")
-    print(f"[{args.model}] All checkpoints: {ckpt_dir}/")
-    print(f"[{args.model}] History: {csv_path}")
+    print(f"\n[{run}] Best val Dice: {best_dice:.4f} at epoch {best_epoch}")
+    print(f"[{run}] Best checkpoint: {os.path.join(args.out_dir, f'{run}_best.pth')}")
+    print(f"[{run}] History: {csv_path}")
 
 
 if __name__ == "__main__":

@@ -1,159 +1,190 @@
 """
-Preprocess PanNuke: convert to binary masks and create deterministic splits.
+Preprocess PanNuke into the official three-fold benchmark format.
 
-Loads folds one at a time from data/raw/, converts the 6-channel masks
-into binary (nuclei vs background), and splits deterministically into
-train/val/test (70/15/15).
+Loads each raw fold one at a time and writes, per fold:
+    images    (N, 256, 256, 3) uint8   H&E patch
+    insts     (N, 256, 256)    int16   nucleus instance IDs, 0 = background
+    types     (N, 256, 256)    uint8   nucleus class 1-5, 0 = background
+    masks     (N, 256, 256)    uint8   binary nuclei mask (legacy baselines)
+    tissues   (N,)             object  tissue type string per patch
 
-Memory-efficient: processes and frees each fold before loading the next.
+The raw PanNuke masks are (N, 256, 256, 6) where channels 0-4 hold per-class
+instance IDs and channel 5 is background. IDs are only unique within a channel,
+so each channel is relabelled to a contiguous range and offset past the IDs
+already assigned, giving one unique ID per nucleus in the patch.
+
+Folds are kept intact. The official PanNuke protocol trains on one fold,
+validates on a second and tests on the third, rotating over all three splits
+(see SPLITS in dataset.py). The folds must never be pooled and re-split at
+random: patches within a fold can come from the same tissue section, so a
+pooled random split leaks between train and test and produces numbers that
+cannot be compared against any published result.
+
+Memory-efficient: masks are memory-mapped and converted one patch at a time,
+so peak RAM stays at roughly one fold of images.
 
 Output structure:
     data/processed/
-        train_images.npy   (N_train, 256, 256, 3)
-        train_masks.npy    (N_train, 256, 256)      binary uint8
-        train_types.npy    (N_train,)               tissue type strings
-        val_images.npy
-        val_masks.npy
-        val_types.npy
-        test_images.npy
-        test_masks.npy
-        test_types.npy
+        fold1_images.npy
+        fold1_insts.npy
+        fold1_types.npy
+        fold1_masks.npy
+        fold1_tissues.npy
+        fold2_...
+        fold3_...
 
 Usage:
     python src/preprocess.py
+    python src/preprocess.py --folds fold_1 fold_2
 """
 
+import argparse
 import os
+
 import numpy as np
 
 RAW_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
 PROCESSED_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "processed")
 
-SEED = 42
-TRAIN_RATIO = 0.70
-VAL_RATIO = 0.15
-# TEST_RATIO = 0.15 (remainder)
-
 FOLDS = ["fold_1", "fold_2", "fold_3"]
+
+# PanNuke nuclei classes, in raw mask channel order. Channel 5 is background.
+TYPE_NAMES = ["Neoplastic", "Inflammatory", "Connective", "Dead", "Epithelial"]
+NUM_TYPES = len(TYPE_NAMES)
 
 
 def get_fold_paths(fold_name):
-    """Return paths to images, types, masks for a fold."""
+    """Return paths to images, tissue types, masks for a fold."""
     fold_num = fold_name.split("_")[1]
     folder_name = f"Fold {fold_num}"
     img_path = os.path.join(RAW_DIR, folder_name, "images", f"fold{fold_num}", "images.npy")
-    types_path = os.path.join(RAW_DIR, folder_name, "images", f"fold{fold_num}", "types.npy")
+    tissue_path = os.path.join(RAW_DIR, folder_name, "images", f"fold{fold_num}", "types.npy")
     masks_path = os.path.join(RAW_DIR, folder_name, "masks", f"fold{fold_num}", "masks.npy")
-    return img_path, types_path, masks_path
+    return img_path, tissue_path, masks_path
 
 
-def get_fold_size(fold_name):
-    """Get number of samples in a fold without loading the full array."""
-    img_path, _, _ = get_fold_paths(fold_name)
-    images = np.load(img_path, mmap_mode="r")
+def remap_label(label):
+    """
+    Relabel an ID map so IDs are contiguous 1..N, keeping 0 as background.
+
+    PanNuke IDs are sparse (a patch can hold IDs 3, 17, 204), and the fast PQ
+    implementation indexes instance masks by ID, so IDs must be contiguous.
+
+    Args:
+        label: (H, W) integer-valued array
+
+    Returns:
+        (H, W) int32 array with IDs 1..N
+    """
+    label = np.asarray(label).astype(np.int32)
+    ids, inverse = np.unique(label, return_inverse=True)
+    out = inverse.reshape(label.shape).astype(np.int32)
+
+    # np.unique sorts, so background (0) lands at index 0 when present. If the
+    # patch has no background at all, shift so IDs still start at 1.
+    if ids[0] != 0:
+        out += 1
+
+    return out
+
+
+def mask_to_instance_and_type(mask):
+    """
+    Convert one PanNuke (256, 256, 6) mask into an instance map and a type map.
+
+    Args:
+        mask: (256, 256, 6) per-class instance IDs, channel 5 is background
+
+    Returns:
+        inst: (256, 256) int16, unique ID per nucleus, 0 = background
+        type_map: (256, 256) uint8, class 1-5, 0 = background
+    """
+    inst = np.zeros(mask.shape[:2], dtype=np.int32)
+    type_map = np.zeros(mask.shape[:2], dtype=np.uint8)
+
+    offset = 0
+    for ch in range(NUM_TYPES):
+        layer = remap_label(mask[:, :, ch])
+        if layer.max() == 0:
+            continue
+
+        foreground = layer > 0
+        inst[foreground] = layer[foreground] + offset
+        type_map[foreground] = ch + 1
+        offset = int(inst.max())
+
+    if inst.max() > np.iinfo(np.int16).max:
+        raise ValueError(f"Patch has {inst.max()} instances, too many for int16")
+
+    return inst.astype(np.int16), type_map
+
+
+def process_fold(fold_name, out_dir):
+    """Convert one raw fold and save its arrays to out_dir."""
+    fold_key = fold_name.replace("_", "")
+    img_path, tissue_path, masks_path = get_fold_paths(fold_name)
+
+    print(f"\nProcessing {fold_name}...")
+
+    images = np.load(img_path)
+    if images.dtype != np.uint8:
+        # Some PanNuke releases ship images as float64 in [0, 255].
+        images = np.clip(images, 0, 255).astype(np.uint8)
+
+    tissues = np.load(tissue_path, allow_pickle=True)
+
+    # Masks are the largest array by far (float64, 6 channels), so stream them.
+    masks = np.load(masks_path, mmap_mode="r")
+
     n = images.shape[0]
-    del images
-    return n
+    print(f"  {n} patches, images {images.shape} {images.dtype}, masks {masks.shape} {masks.dtype}")
 
+    insts = np.zeros((n, 256, 256), dtype=np.int16)
+    types = np.zeros((n, 256, 256), dtype=np.uint8)
 
-def masks_to_binary(masks):
-    """
-    Convert PanNuke multi-class masks to binary.
+    for i in range(n):
+        inst, type_map = mask_to_instance_and_type(np.asarray(masks[i]))
+        insts[i] = inst
+        types[i] = type_map
 
-    PanNuke masks shape: (N, 256, 256, 6)
-    Channels 0-4: five nuclei classes (neoplastic, inflammatory, connective, dead, epithelial)
-    Channel 5: background
+        if (i + 1) % 500 == 0 or i + 1 == n:
+            print(f"  {i + 1}/{n} patches converted")
 
-    Binary mask: 1 where any nuclei class > 0, else 0.
-    """
-    nuclei_channels = masks[:, :, :, :5]
-    binary = (nuclei_channels.sum(axis=-1) > 0).astype(np.uint8)
-    return binary
+    binary = (insts > 0).astype(np.uint8)
 
+    total_nuclei = sum(int(insts[i].max()) for i in range(n))
+    print(f"  {total_nuclei} nuclei, {binary.mean() * 100:.2f}% foreground pixels")
 
-def deterministic_split(n, seed=SEED):
-    """Return train/val/test index arrays with fixed random seed."""
-    rng = np.random.default_rng(seed)
-    indices = rng.permutation(n)
+    np.save(os.path.join(out_dir, f"{fold_key}_images.npy"), images)
+    np.save(os.path.join(out_dir, f"{fold_key}_insts.npy"), insts)
+    np.save(os.path.join(out_dir, f"{fold_key}_types.npy"), types)
+    np.save(os.path.join(out_dir, f"{fold_key}_masks.npy"), binary)
+    np.save(os.path.join(out_dir, f"{fold_key}_tissues.npy"), tissues)
 
-    n_train = int(n * TRAIN_RATIO)
-    n_val = int(n * VAL_RATIO)
+    print(f"  Saved {fold_key}_*.npy")
 
-    train_idx = indices[:n_train]
-    val_idx = indices[n_train : n_train + n_val]
-    test_idx = indices[n_train + n_val :]
-
-    return train_idx, val_idx, test_idx
+    return n, total_nuclei
 
 
 def main():
-    os.makedirs(PROCESSED_DIR, exist_ok=True)
+    parser = argparse.ArgumentParser(description="Preprocess PanNuke into official fold arrays")
+    parser.add_argument("--folds", type=str, nargs="+", default=FOLDS, choices=FOLDS)
+    parser.add_argument("--out-dir", type=str, default=PROCESSED_DIR)
+    args = parser.parse_args()
 
-    # First pass: get total size
-    fold_sizes = []
-    for fold_name in FOLDS:
-        n = get_fold_size(fold_name)
-        fold_sizes.append(n)
-        print(f"{fold_name}: {n} samples")
+    os.makedirs(args.out_dir, exist_ok=True)
 
-    total = sum(fold_sizes)
-    print(f"Total: {total} samples")
+    totals = []
+    for fold_name in args.folds:
+        totals.append(process_fold(fold_name, args.out_dir))
 
-    # Compute split indices over the full dataset
-    train_idx, val_idx, test_idx = deterministic_split(total)
-    print(f"Split: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
-
-    # Convert global indices to sets for fast lookup
-    split_indices = {"train": np.sort(train_idx), "val": np.sort(val_idx), "test": np.sort(test_idx)}
-
-    # Pre-allocate output arrays
-    split_images = {s: np.zeros((len(idx), 256, 256, 3), dtype=np.uint8) for s, idx in split_indices.items()}
-    split_masks = {s: np.zeros((len(idx), 256, 256), dtype=np.uint8) for s, idx in split_indices.items()}
-    split_types = {s: np.empty(len(idx), dtype=object) for s, idx in split_indices.items()}
-
-    # Track where to insert into each split's output array
-    split_pos = {"train": 0, "val": 0, "test": 0}
-
-    # Build a mapping: for each global index, which split and what position
-    index_to_split = {}
-    for split_name, idx in split_indices.items():
-        for pos, global_idx in enumerate(idx):
-            index_to_split[int(global_idx)] = (split_name, pos)
-
-    # Second pass: load one fold at a time and distribute samples
-    offset = 0
-    for fold_name, fold_size in zip(FOLDS, fold_sizes):
-        print(f"\nProcessing {fold_name}...")
-        img_path, types_path, masks_path = get_fold_paths(fold_name)
-
-        images = np.load(img_path)
-        types = np.load(types_path, allow_pickle=True)
-        masks = np.load(masks_path)
-
-        print(f"  Converting masks to binary...")
-        binary_masks = masks_to_binary(masks)
-        del masks
-
-        # Place each sample in its split
-        for local_i in range(fold_size):
-            global_i = offset + local_i
-            split_name, pos = index_to_split[global_i]
-            split_images[split_name][pos] = images[local_i]
-            split_masks[split_name][pos] = binary_masks[local_i]
-            split_types[split_name][pos] = types[local_i]
-
-        offset += fold_size
-        del images, binary_masks, types
-
-    # Save
-    print("\nSaving...")
-    for split_name in ["train", "val", "test"]:
-        np.save(os.path.join(PROCESSED_DIR, f"{split_name}_images.npy"), split_images[split_name])
-        np.save(os.path.join(PROCESSED_DIR, f"{split_name}_masks.npy"), split_masks[split_name])
-        np.save(os.path.join(PROCESSED_DIR, f"{split_name}_types.npy"), split_types[split_name])
-        print(f"  {split_name}: {len(split_images[split_name])} samples")
-
-    print(f"\nDone. Saved to: {os.path.abspath(PROCESSED_DIR)}")
+    print(f"\n{'=' * 60}")
+    print("  SUMMARY")
+    print(f"{'=' * 60}")
+    for fold_name, (n, nuclei) in zip(args.folds, totals):
+        print(f"  {fold_name}: {n} patches, {nuclei} nuclei")
+    print(f"  Total: {sum(t[0] for t in totals)} patches, {sum(t[1] for t in totals)} nuclei")
+    print(f"\nDone. Saved to: {os.path.abspath(args.out_dir)}")
 
 
 if __name__ == "__main__":

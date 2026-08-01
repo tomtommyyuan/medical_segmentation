@@ -98,7 +98,8 @@ def predict_chroma(model, loader, device, use_tta):
 
 
 @torch.no_grad()
-def predict_binary_baseline(model_name, fold, data_dir, device, split):
+def predict_binary_baseline(model_name, fold, data_dir, device, split,
+                            results_dir=RESULTS_DIR):
     """
     Instances from a binary baseline, via connected components.
 
@@ -113,7 +114,7 @@ def predict_binary_baseline(model_name, fold, data_dir, device, split):
         masks = np.stack([segment_single(np.asarray(images[i])) for i in range(len(images))])
     else:
         model = BINARY_MODELS[model_name]()
-        checkpoint_path = os.path.join(RESULTS_DIR, f"{model_name}_split{split}_best.pth")
+        checkpoint_path = os.path.join(results_dir, f"{model_name}_split{split}_best.pth")
         model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
         model.to(device).eval()
 
@@ -164,7 +165,7 @@ def evaluate_split(args, split, device):
         pred_inst, pred_type = predict_chroma(model, loader, device, args.tta)
     else:
         pred_inst, pred_type = predict_binary_baseline(
-            args.model, fold, args.data_dir, device, split
+            args.model, fold, args.data_dir, device, split, args.out_dir
         )
 
     return score_fold(pred_inst, pred_type, true_inst, true_type, tissues)

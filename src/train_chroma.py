@@ -201,9 +201,13 @@ def validate(model, loader, criterion, device, args, max_patches=VAL_SUBSET):
 
     Decoding and PQ are CPU-bound, so only the first max_patches patches are
     scored. The ranking between epochs is stable enough for checkpoint
-    selection; evaluate_instance.py scores the full fold.
+    selection; evaluate_instance.py scores the full fold. Pass 0 to score
+    everything.
     """
     model.eval()
+
+    if max_patches <= 0:
+        max_patches = len(loader.dataset)
 
     total_loss = 0.0
     n_samples = 0
@@ -283,7 +287,8 @@ def main():
     parser.add_argument("--ema-decay", type=float, default=EMA_DECAY)
     parser.add_argument("--clip-grad", type=float, default=5.0)
     parser.add_argument("--warmup-epochs", type=int, default=WARMUP_EPOCHS)
-    parser.add_argument("--val-subset", type=int, default=VAL_SUBSET)
+    parser.add_argument("--val-subset", type=int, default=VAL_SUBSET,
+                        help="patches scored with the full instance pipeline per epoch, 0 for all")
     parser.add_argument("--amp", action="store_true", default=True)
     parser.add_argument("--no-amp", dest="amp", action="store_false")
     parser.add_argument("--no-pretrained", action="store_true",
@@ -395,8 +400,10 @@ def main():
         csv_file.flush()
 
         # Selected on mPQ, not loss: the benchmark reports mPQ and the two do
-        # not peak at the same epoch.
-        if metrics["mpq"] > best_mpq:
+        # not peak at the same epoch. Epoch 1 always writes, so a run whose mPQ
+        # is NaN or never rises still leaves a loadable checkpoint and fails
+        # later on a bad score rather than on a missing file.
+        if epoch == 1 or metrics["mpq"] > best_mpq:
             best_mpq = metrics["mpq"]
             best_epoch = epoch
             torch.save(

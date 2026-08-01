@@ -10,6 +10,8 @@ __pycache__/
 # Results
 results/
 *.pth
+*.log
+logs/
 
 # OS
 .DS_Store

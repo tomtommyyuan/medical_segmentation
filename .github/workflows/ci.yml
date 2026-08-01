@@ -1,0 +1,42 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # CPU torch only. The test suite runs on synthetic patches and needs no
+      # dataset, no GPU and no model-hub access, so CI stays under a minute.
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy scipy opencv-python-headless scikit-image matplotlib pytest
+
+      - name: Test
+        run: pytest tests/ -q
+
+      # Catches an import that only exists on the training machine, which
+      # otherwise surfaces after a job has already been queued. timm and
+      # transformers are deliberately not installed here: the encoders import
+      # them lazily, so every module must load without them.
+      - name: Check every script imports
+        working-directory: src
+        run: |
+          python -m compileall -q .
+          python -c "import attention_unet, chroma_net, classical, cnn_baseline, dataset, \
+            download_data, evaluate, evaluate_by_tissue, evaluate_instance, hover_targets, \
+            losses, plot_training, postprocess, pq_metrics, preprocess, stain_augment, tta, \
+            train, train_chroma, unet, visualize_qualitative"

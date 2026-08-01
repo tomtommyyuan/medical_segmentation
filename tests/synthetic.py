@@ -7,6 +7,15 @@ and a chain of three, which is the case the distance maps exist to handle.
 
 import numpy as np
 
+# Macenko's reference H and E vectors, hardcoded rather than imported from
+# stain_augment so the fixture does not depend on the code it is used to test.
+_STAIN_MATRIX = np.array(
+    [[0.5626, 0.2159],
+     [0.7201, 0.8012],
+     [0.4062, 0.5581]]
+)
+_IO = 240.0
+
 
 def draw_disc(canvas, cy, cx, radius, value):
     """Stamp a filled disc onto a canvas, overwriting whatever is there."""
@@ -47,18 +56,29 @@ def make_patch(size=256):
 
 
 def make_image(inst, seed=0):
-    """Build a plausible H&E-looking RGB patch: purple nuclei on pink stroma."""
+    """
+    Build an H&E-like RGB patch by construction in optical density space.
+
+    Nuclei get a high haematoxylin concentration and low eosin, stroma the
+    reverse, and the patch is rendered through the reference stain vectors.
+    Building it this way rather than picking two RGB colours gives a patch whose
+    stain vectors are actually recoverable by Macenko's method, which is what
+    the stain tests need in order to exercise anything.
+
+    Args:
+        inst: (H, W) instance map, used only to place nuclei
+        seed: seed for the per-pixel concentration noise
+
+    Returns:
+        (H, W, 3) uint8 RGB patch
+    """
     rng = np.random.default_rng(seed)
-    image = np.zeros(inst.shape + (3,), dtype=np.float32)
-
-    image[..., 0] = 220.0
-    image[..., 1] = 180.0
-    image[..., 2] = 210.0
-
     foreground = inst > 0
-    image[foreground, 0] = 110.0
-    image[foreground, 1] = 70.0
-    image[foreground, 2] = 160.0
 
-    image += rng.normal(0, 4.0, image.shape)
-    return np.clip(image, 0, 255).astype(np.uint8)
+    haematoxylin = np.where(foreground, 1.4, 0.15) + rng.normal(0, 0.05, inst.shape)
+    eosin = np.where(foreground, 0.25, 0.9) + rng.normal(0, 0.05, inst.shape)
+
+    concentrations = np.stack([haematoxylin.ravel(), eosin.ravel()])
+    od = (_STAIN_MATRIX @ concentrations).T.reshape(inst.shape + (3,))
+
+    return np.clip(_IO * np.exp(-od), 0, 255).astype(np.uint8)

@@ -35,8 +35,11 @@ def get_fast_pq(true, pred, match_iou=0.5):
     """
     Compute DQ, SQ and PQ between two instance maps.
 
-    Instance IDs are relabelled to a contiguous range internally, so callers do
-    not have to pre-remap.
+    Instance IDs may be arbitrary and need not be contiguous or start at 1;
+    masks are looked up by ID rather than by position. The reference
+    implementation indexes a list positionally and assumes ID k sits at slot k,
+    which silently requires that background be present and the IDs be dense. A
+    prediction covering every pixel has no background, shifting every index.
 
     Args:
         true: (H, W) instance map, 0 = background
@@ -49,57 +52,53 @@ def get_fast_pq(true, pred, match_iou=0.5):
     if match_iou < 0.0:
         raise ValueError("match_iou must be non-negative")
 
-    true = remap_label(true)
-    pred = remap_label(pred)
+    true = np.asarray(true)
+    pred = np.asarray(pred)
 
-    true_ids = list(np.unique(true))
-    pred_ids = list(np.unique(pred))
+    true_ids = [int(i) for i in np.unique(true) if i != 0]
+    pred_ids = [int(i) for i in np.unique(pred) if i != 0]
 
-    if len(true_ids) == 1 and len(pred_ids) == 1:
+    if not true_ids and not pred_ids:
         # Nothing in either map. PQ is undefined; callers decide how to treat it.
         return [0.0, 0.0, 0.0], [[], [], [], []]
 
-    true_masks = [None]
-    for t in true_ids[1:]:
-        true_masks.append(np.array(true == t, np.uint8))
+    true_masks = {i: np.array(true == i, np.uint8) for i in true_ids}
+    pred_masks = {i: np.array(pred == i, np.uint8) for i in pred_ids}
 
-    pred_masks = [None]
-    for p in pred_ids[1:]:
-        pred_masks.append(np.array(pred == p, np.uint8))
+    true_position = {i: k for k, i in enumerate(true_ids)}
+    pred_position = {i: k for k, i in enumerate(pred_ids)}
 
     # Pairwise IoU, only over pairs that actually overlap.
-    pairwise_iou = np.zeros([len(true_ids) - 1, len(pred_ids) - 1], dtype=np.float64)
+    pairwise_iou = np.zeros([len(true_ids), len(pred_ids)], dtype=np.float64)
 
-    for true_id in true_ids[1:]:
+    for true_id in true_ids:
         t_mask = true_masks[true_id]
-        overlapping = np.unique(pred[t_mask > 0])
-        for pred_id in overlapping:
+        for pred_id in np.unique(pred[t_mask > 0]):
             if pred_id == 0:
                 continue
-            p_mask = pred_masks[pred_id]
+            p_mask = pred_masks[int(pred_id)]
             total = (t_mask + p_mask).sum()
             inter = (t_mask * p_mask).sum()
-            pairwise_iou[true_id - 1, pred_id - 1] = inter / (total - inter)
+            pairwise_iou[true_position[true_id], pred_position[int(pred_id)]] = (
+                inter / (total - inter)
+            )
 
     if match_iou >= 0.5:
         # Above 0.5 at most one prediction can match a given ground truth.
         pairwise_iou[pairwise_iou <= match_iou] = 0.0
-        paired_true, paired_pred = np.nonzero(pairwise_iou)
-        paired_iou = pairwise_iou[paired_true, paired_pred]
-        paired_true = paired_true + 1
-        paired_pred = paired_pred + 1
+        true_slots, pred_slots = np.nonzero(pairwise_iou)
+        paired_iou = pairwise_iou[true_slots, pred_slots]
     else:
-        paired_true, paired_pred = linear_sum_assignment(-pairwise_iou)
-        paired_iou = pairwise_iou[paired_true, paired_pred]
+        true_slots, pred_slots = linear_sum_assignment(-pairwise_iou)
+        paired_iou = pairwise_iou[true_slots, pred_slots]
         keep = paired_iou > match_iou
-        paired_true = paired_true[keep] + 1
-        paired_pred = paired_pred[keep] + 1
-        paired_iou = paired_iou[keep]
+        true_slots, pred_slots, paired_iou = true_slots[keep], pred_slots[keep], paired_iou[keep]
 
-    paired_true_set = set(int(i) for i in paired_true)
-    paired_pred_set = set(int(i) for i in paired_pred)
-    unpaired_true = [idx for idx in true_ids[1:] if int(idx) not in paired_true_set]
-    unpaired_pred = [idx for idx in pred_ids[1:] if int(idx) not in paired_pred_set]
+    paired_true = [true_ids[slot] for slot in true_slots]
+    paired_pred = [pred_ids[slot] for slot in pred_slots]
+
+    unpaired_true = [i for i in true_ids if i not in set(paired_true)]
+    unpaired_pred = [i for i in pred_ids if i not in set(paired_pred)]
 
     tp = len(paired_true)
     fp = len(unpaired_pred)

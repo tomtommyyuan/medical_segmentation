@@ -106,6 +106,53 @@ def test_non_contiguous_ids_are_handled():
     assert np.isclose(pq, 1.0, atol=1e-5)
 
 
+def test_prediction_with_no_background_is_handled():
+    # An over-confident model can label every pixel, leaving no id 0 at all.
+    # Looking masks up by position rather than by id breaks here, and it breaks
+    # during validation, hours into a run.
+    true = np.zeros((32, 32), dtype=np.int32)
+    square(true, 0, 16, 0, 32, 1)
+    square(true, 16, 32, 0, 32, 2)
+
+    pred = np.zeros((32, 32), dtype=np.int32)
+    square(pred, 0, 16, 0, 32, 1)
+    square(pred, 16, 32, 0, 32, 2)
+
+    assert pred.min() > 0, "test setup: the prediction should cover every pixel"
+
+    (_, _, pq), _ = get_fast_pq(true, pred)
+    assert np.isclose(pq, 1.0, atol=1e-5)
+
+
+def test_ids_starting_above_one_are_handled():
+    true = np.zeros((32, 32), dtype=np.int32)
+    square(true, 4, 12, 4, 12, 5)
+
+    pred = np.zeros((32, 32), dtype=np.int32)
+    square(pred, 4, 12, 4, 12, 900)
+
+    (_, _, pq), (paired_true, paired_pred, _, _) = get_fast_pq(true, pred)
+
+    assert np.isclose(pq, 1.0, atol=1e-5)
+    assert list(paired_true) == [5]
+    assert list(paired_pred) == [900]
+
+
+def test_pq_per_image_survives_a_full_coverage_prediction():
+    true_inst = np.zeros((32, 32), dtype=np.int32)
+    true_type = np.zeros((32, 32), dtype=np.uint8)
+    square(true_inst, 4, 12, 4, 12, 1)
+    square(true_type, 4, 12, 4, 12, 1)
+
+    pred_inst = np.ones((32, 32), dtype=np.int32)
+    pred_type = np.ones((32, 32), dtype=np.uint8)
+
+    bpq, class_pq = pq_per_image(true_inst, true_type, pred_inst, pred_type)
+
+    assert np.isfinite(bpq)
+    assert np.isfinite(class_pq[0])
+
+
 def test_class_absent_from_both_is_nan_not_zero():
     true_inst = np.zeros((64, 64), dtype=np.int32)
     true_type = np.zeros((64, 64), dtype=np.uint8)

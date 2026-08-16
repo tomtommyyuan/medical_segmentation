@@ -298,6 +298,8 @@ def main():
     parser.add_argument("--tag", type=str, default="chroma")
     parser.add_argument("--data-dir", type=str, default=DATA_DIR)
     parser.add_argument("--out-dir", type=str, default=RESULTS_DIR)
+    parser.add_argument("--save-every", type=int, default=0,
+                        help="also keep every Nth epoch's checkpoint; 0 keeps only the best")
     parser.add_argument("--limit-batches", type=int, default=0,
                         help="stop each epoch after N batches, for smoke tests")
     args = parser.parse_args()
@@ -412,8 +414,13 @@ def main():
                 os.path.join(args.out_dir, f"{run}_best.pth"),
             )
 
-        torch.save({"model": model.state_dict(), "args": vars(args), "epoch": epoch},
-                   os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pth"))
+        # Off by default. state_dict() holds the frozen encoder too, so a
+        # checkpoint is ~1.3 GB whatever the trainable count says; keeping one
+        # per epoch is 63 GB per split, and the ablation grid would be half a
+        # terabyte. The best checkpoint above is what evaluation loads.
+        if args.save_every and epoch % args.save_every == 0:
+            torch.save({"model": model.state_dict(), "args": vars(args), "epoch": epoch},
+                       os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pth"))
 
     csv_file.close()
 

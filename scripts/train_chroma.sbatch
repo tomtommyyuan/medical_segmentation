@@ -47,6 +47,12 @@ export PYTHONNOUSERSITE=1
 export HF_HOME=${HF_HOME:-${SCRATCH:-/tmp}/huggingface}
 export TOKENIZERS_PARALLELISM=false
 
+# Compute nodes here have no outbound internet, so a cold cache would stall
+# until the connection times out rather than failing. Offline mode turns
+# that into an immediate, legible error. Warm the cache first with
+# scripts/prefetch_encoder.sh on a login node.
+export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
+
 python src/train_chroma.py \
     --split "${SLURM_ARRAY_TASK_ID}" \
     --encoder "${ENCODER}" \

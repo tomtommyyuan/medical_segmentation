@@ -152,6 +152,8 @@ def main():
     parser.add_argument("--warmup-epochs", type=int, default=WARMUP_EPOCHS)
     parser.add_argument("--no-augment", action="store_true",
                         help="reproduce the original runs, which had no augmentation")
+    parser.add_argument("--save-every", type=int, default=0,
+                        help="also keep every Nth epoch's checkpoint; 0 keeps only the best")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--data-dir", type=str, default=DATA_DIR)
     parser.add_argument("--out-dir", type=str, default=RESULTS_DIR)
@@ -241,7 +243,10 @@ def main():
             best_epoch = epoch
             torch.save(model.state_dict(), os.path.join(args.out_dir, f"{run}_best.pth"))
 
-        torch.save(model.state_dict(), os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pth"))
+        # Off by default: 124 MB a checkpoint across nine baseline runs adds
+        # up to ~56 GB of epochs nothing reads.
+        if args.save_every and epoch % args.save_every == 0:
+            torch.save(model.state_dict(), os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pth"))
 
     csv_file.close()
 

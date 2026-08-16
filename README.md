@@ -142,10 +142,19 @@ python src/plot_training.py
 On Slurm:
 
 ```bash
+# ON A LOGIN NODE, once. Compute nodes have no outbound internet, so the first
+# from_pretrained() inside a job stalls until it times out rather than failing.
+bash scripts/prefetch_encoder.sh
+
 sbatch scripts/train_chroma.sbatch        # job array over the three splits
 sbatch scripts/train_baselines.sbatch
 bash   scripts/run_ablations.sh
 ```
+
+The job scripts set `PYTHONNOUSERSITE=1` so a stray package in `~/.local`
+cannot shadow the environment, `HF_HOME` on `$SCRATCH` because `$HOME` quotas
+fail a 1.2 GB download, and `HF_HUB_OFFLINE=1` so a cold cache errors
+immediately instead of hanging.
 
 Before queueing anything, smoke-test the whole pipeline in about a minute:
 

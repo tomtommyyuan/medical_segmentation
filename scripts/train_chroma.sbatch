@@ -11,10 +11,10 @@
 #
 #SBATCH --job-name=chroma
 #SBATCH --array=1-3
-#SBATCH --partition=gpu
+#SBATCH --partition=rli2
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --mem=60G
 #SBATCH --time=16:00:00
 #SBATCH --output=logs/chroma_%A_%a.out
 #SBATCH --error=logs/chroma_%A_%a.err
@@ -24,7 +24,10 @@ set -euo pipefail
 ENCODER=${ENCODER:-phikon}
 TAG=${TAG:-chroma}
 EPOCHS=${EPOCHS:-50}
-BATCH_SIZE=${BATCH_SIZE:-16}
+# 8 fits a 24GB card with consistency=teacher, which runs three ViT-L
+# forward passes per step. Raise to 16 on a 40GB+ GPU:
+#     sbatch --export=ALL,BATCH_SIZE=16 scripts/train_chroma.sbatch
+BATCH_SIZE=${BATCH_SIZE:-8}
 EXTRA=${EXTRA:-}
 
 mkdir -p logs
@@ -35,10 +38,32 @@ echo "encoder     ${ENCODER}"
 echo "tag         ${TAG}"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
+# Activate the environment explicitly rather than relying on --export=ALL to
+# carry the submitting shell's PATH. A resubmission from a shell where the env
+# is not active would otherwise run the base interpreter and die on the first
+# import, several minutes into the job.
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "${CONDA_ENV:-medseg}"
+
+echo "python      $(which python)"
+
+# Ignore ~/.local/lib/python*/site-packages. A stray package there shadows the
+# conda env on every node, and a broken one takes the job with it: a partial
+# scikit-learn in ~/.local made transformers' optional sklearn probe succeed
+# and then fail on its missing joblib, killing model construction. Jobs should
+# see only what the environment declares.
+export PYTHONNOUSERSITE=1
+
 # Keep the model cache on scratch rather than $HOME, which is quota-limited on
 # most clusters and will silently fail a 1.2 GB ViT-L download.
 export HF_HOME=${HF_HOME:-${SCRATCH:-/tmp}/huggingface}
 export TOKENIZERS_PARALLELISM=false
+
+# Compute nodes here have no outbound internet, so a cold cache would stall
+# until the connection times out rather than failing. Offline mode turns
+# that into an immediate, legible error. Warm the cache first with
+# scripts/prefetch_encoder.sh on a login node.
+export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
 
 python src/train_chroma.py \
     --split "${SLURM_ARRAY_TASK_ID}" \

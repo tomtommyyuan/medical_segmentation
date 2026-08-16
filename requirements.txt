@@ -10,6 +10,10 @@ torchvision>=0.15
 # Neither is needed for --encoder conv, which is the offline fallback and the
 # "no foundation model" ablation.
 timm>=1.0
-transformers>=4.40
+# Capped below 5: HFViTEncoder passes interpolate_pos_encoding=True so a
+# 224-pretrained ViT accepts 256px patches, and transformers 5 reworked that
+# call. The test suite runs without transformers installed by design, so it
+# cannot catch the break - only a real encoder run does.
+transformers>=4.40,<5
 
 pytest>=7.4

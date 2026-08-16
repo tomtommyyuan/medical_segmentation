@@ -42,6 +42,15 @@ echo "model       ${MODEL}"
 echo "split       ${SPLIT}"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
+# Activate the environment explicitly rather than relying on --export=ALL to
+# carry the submitting shell's PATH. A resubmission from a shell where the env
+# is not active would otherwise run the base interpreter and die on the first
+# import, several minutes into the job.
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "${CONDA_ENV:-medseg}"
+
+echo "python      $(which python)"
+
 python src/train.py \
     --model "${MODEL}" \
     --split "${SPLIT}" \

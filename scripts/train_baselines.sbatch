@@ -35,6 +35,12 @@ SPLIT=$((SLURM_ARRAY_TASK_ID % 3 + 1))
 # see only what the environment declares.
 export PYTHONNOUSERSITE=1
 
+# Slurm redirects stdout to a file, which Python block-buffers rather than
+# line-buffers, so epoch lines sit in an 8KB buffer and a healthy job looks
+# stalled for its first half hour. The history CSV is flushed explicitly and
+# stays accurate either way, but the log should be readable live.
+export PYTHONUNBUFFERED=1
+
 mkdir -p logs
 
 echo "host        $(hostname)"

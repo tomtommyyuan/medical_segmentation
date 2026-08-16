@@ -54,6 +54,12 @@ echo "python      $(which python)"
 # see only what the environment declares.
 export PYTHONNOUSERSITE=1
 
+# Slurm redirects stdout to a file, which Python block-buffers rather than
+# line-buffers, so epoch lines sit in an 8KB buffer and a healthy job looks
+# stalled for its first half hour. The history CSV is flushed explicitly and
+# stays accurate either way, but the log should be readable live.
+export PYTHONUNBUFFERED=1
+
 # Keep the model cache on scratch rather than $HOME, which is quota-limited on
 # most clusters and will silently fail a 1.2 GB ViT-L download.
 export HF_HOME=${HF_HOME:-${SCRATCH:-/tmp}/huggingface}

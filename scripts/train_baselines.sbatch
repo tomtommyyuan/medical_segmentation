@@ -11,10 +11,10 @@
 #
 #SBATCH --job-name=baselines
 #SBATCH --array=0-8
-#SBATCH --partition=gpu
+#SBATCH --partition=rli2
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=48G
+#SBATCH --mem=60G
 #SBATCH --time=08:00:00
 #SBATCH --output=logs/baseline_%A_%a.out
 #SBATCH --error=logs/baseline_%A_%a.err

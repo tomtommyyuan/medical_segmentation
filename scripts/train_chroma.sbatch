@@ -11,10 +11,10 @@
 #
 #SBATCH --job-name=chroma
 #SBATCH --array=1-3
-#SBATCH --partition=gpu
+#SBATCH --partition=rli2
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --mem=60G
 #SBATCH --time=16:00:00
 #SBATCH --output=logs/chroma_%A_%a.out
 #SBATCH --error=logs/chroma_%A_%a.err
@@ -24,7 +24,10 @@ set -euo pipefail
 ENCODER=${ENCODER:-phikon}
 TAG=${TAG:-chroma}
 EPOCHS=${EPOCHS:-50}
-BATCH_SIZE=${BATCH_SIZE:-16}
+# 8 fits a 24GB card with consistency=teacher, which runs three ViT-L
+# forward passes per step. Raise to 16 on a 40GB+ GPU:
+#     sbatch --export=ALL,BATCH_SIZE=16 scripts/train_chroma.sbatch
+BATCH_SIZE=${BATCH_SIZE:-8}
 EXTRA=${EXTRA:-}
 
 mkdir -p logs

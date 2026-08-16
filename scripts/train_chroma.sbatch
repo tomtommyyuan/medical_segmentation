@@ -35,6 +35,13 @@ echo "encoder     ${ENCODER}"
 echo "tag         ${TAG}"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
+# Ignore ~/.local/lib/python*/site-packages. A stray package there shadows the
+# conda env on every node, and a broken one takes the job with it: a partial
+# scikit-learn in ~/.local made transformers' optional sklearn probe succeed
+# and then fail on its missing joblib, killing model construction. Jobs should
+# see only what the environment declares.
+export PYTHONNOUSERSITE=1
+
 # Keep the model cache on scratch rather than $HOME, which is quota-limited on
 # most clusters and will silently fail a 1.2 GB ViT-L download.
 export HF_HOME=${HF_HOME:-${SCRATCH:-/tmp}/huggingface}

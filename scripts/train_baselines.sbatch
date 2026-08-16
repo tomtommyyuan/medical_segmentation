@@ -28,6 +28,13 @@ EXTRA=${EXTRA:-}
 MODEL=${MODELS[$((SLURM_ARRAY_TASK_ID / 3))]}
 SPLIT=$((SLURM_ARRAY_TASK_ID % 3 + 1))
 
+# Ignore ~/.local/lib/python*/site-packages. A stray package there shadows the
+# conda env on every node, and a broken one takes the job with it: a partial
+# scikit-learn in ~/.local made transformers' optional sklearn probe succeed
+# and then fail on its missing joblib, killing model construction. Jobs should
+# see only what the environment declares.
+export PYTHONNOUSERSITE=1
+
 mkdir -p logs
 
 echo "host        $(hostname)"

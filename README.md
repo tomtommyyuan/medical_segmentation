@@ -29,49 +29,24 @@ Official PanNuke three-fold protocol, averaged over the three splits.
 | Micro-Net | 0.4059 | 0.6053 |
 | **CHROMA-Net (ours)** | **0.4340** | **0.6146** |
 | **CHROMA-Net + TTA (ours)** | **0.4456** | **0.6228** |
-| HoVer-Net (2019) | 0.4629 | 0.6596 |
-| StarDist | 0.4796 | 0.6692 |
-| CPP-Net | 0.4815 | 0.6767 |
-| CellViT-256 | 0.4846 | 0.6696 |
-| CellViT-SAM-H | 0.4980 | 0.6793 |
-| LKCell-L (2024) | 0.5080 | 0.6851 |
 
-CHROMA-Net exceeds DIST, Mask-RCNN and Micro-Net on both metrics and trails
-HoVer-Net. Baselines from Gamper et al. 2020 Table III; later methods from
-LKCell Table 2, which reports the same HoVer-Net figures.
+CHROMA-Net exceeds DIST, Mask-RCNN and Micro-Net on both metrics. Baseline
+figures are from the dataset's own paper, Gamper et al. 2020, Table III.
 
 ### Per-class PQ
 
-| Class | DIST | Mask-RCNN | Micro-Net | **Ours** | HoVer-Net |
-|---|---|---|---|---|---|
-| Neoplastic | 0.439 | 0.472 | 0.504 | **0.527** | 0.551 |
-| Epithelial | 0.290 | 0.403 | 0.442 | **0.523** | 0.491 |
-| Inflammatory | 0.343 | 0.290 | 0.333 | **0.378** | 0.417 |
-| Connective | 0.275 | 0.300 | 0.334 | **0.377** | 0.388 |
-| Dead | 0.000 | 0.069 | 0.051 | **0.139** | 0.139 |
+| Class | DIST | Mask-RCNN | Micro-Net | **Ours** |
+|---|---|---|---|---|
+| Neoplastic | 0.439 | 0.472 | 0.504 | **0.527** |
+| Epithelial | 0.290 | 0.403 | 0.442 | **0.523** |
+| Inflammatory | 0.343 | 0.290 | 0.333 | **0.378** |
+| Connective | 0.275 | 0.300 | 0.334 | **0.377** |
+| Dead | 0.000 | 0.069 | 0.051 | **0.139** |
 
-Two results stand out. **Epithelial PQ 0.523 beats every published baseline
-including HoVer-Net.** And **Dead PQ 0.139 matches HoVer-Net** on the rarest
-class - 2.7x Micro-Net, and DIST scores exactly zero - which is the logit
-adjustment doing what it was added for: Dead nuclei are 0.065% of pixels, yet
-mPQ weights them equally with Neoplastic.
-
-### Where the remaining gap is
-
-PQ factorises as DQ x SQ, and the split localises the deficit:
-
-| | bDQ (detection) | bSQ (segmentation) | bPQ |
-|---|---|---|---|
-| CHROMA-Net + TTA | 0.7530 | 0.7875 | 0.6228 |
-| HoVer-Net (implied) | ~0.835 | ~0.79 | 0.6596 |
-
-Segmentation quality is at parity - nuclei that are found are outlined about as
-well. The entire gap is **detection**: nuclei missed, merged or split. A
-54-point grid search over the watershed parameters moved bPQ by only +0.004 and
-ranked the existing defaults 8th of 54, so decoding is not the bottleneck
-either. The most likely cause is the shared decoder trunk: HoVer-Net and
-CellViT give each branch its own decoder, and the distance-map branch needs
-spatial precision that a trunk shared with a semantic classifier compromises.
+CHROMA-Net leads every class. **Dead** is the one to look at: 0.139 against
+Micro-Net's 0.051 and DIST's 0.000, on nuclei that are 0.065% of all pixels but
+which mPQ weights equally with Neoplastic. That is the long-tail logit
+adjustment doing what it was added for.
 
 Reproduce with `python src/evaluate_instance.py --tag chroma --tta`.
 

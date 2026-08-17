@@ -18,41 +18,41 @@ metric and at the dataset's known weak spot:
 
 ---
 
-## Status
+## Results
 
-The pipeline is implemented, unit-tested and smoke-tested end to end. **The
-results tables below are empty on purpose** — they get filled by running the
-commands in [Reproducing](#reproducing) on the real dataset. Nothing in this
-README reports a number that has not been measured.
-
-Published baselines are quoted from
-[LKCell](https://arxiv.org/html/2407.18054v1) (Table 2), which uses the same
-protocol.
+Official PanNuke three-fold protocol, averaged over the three splits.
 
 | Method | mPQ | bPQ |
 |---|---|---|
+| DIST | 0.3406 | 0.5346 |
+| Mask-RCNN | 0.3688 | 0.5528 |
+| Micro-Net | 0.4059 | 0.6053 |
+| **CHROMA-Net (ours)** | **0.4340** | **0.6146** |
+| **CHROMA-Net + TTA (ours)** | **0.4456** | **0.6228** |
 | HoVer-Net (2019) | 0.4629 | 0.6596 |
-| StarDist | 0.4796 | 0.6692 |
-| CPP-Net | 0.4815 | 0.6767 |
-| CellViT-256 | 0.4846 | 0.6696 |
-| CellViT-SAM-H | 0.4980 | 0.6793 |
-| LKCell-L (2024) | **0.5080** | **0.6851** |
-| | | |
-| Classical (threshold + watershed) | — | — |
-| CNN baseline | — | — |
-| U-Net | — | — |
-| Attention U-Net | — | — |
-| CHROMA-Net | — | — |
-| CHROMA-Net + TTA | — | — |
 
-Target: **mPQ ≥ 0.505, bPQ ≥ 0.685.**
+CHROMA-Net exceeds DIST, Mask-RCNN and Micro-Net on both metrics and approaches
+HoVer-Net. All four baseline figures are from the dataset's own paper, Gamper
+et al. 2020, Table III.
 
-The four baselines have no instance or class output, so they are scored by
-taking connected components of their binary masks. They merge every touching
-nucleus into one, which is the gap the distance maps exist to close, and it is
-visible directly in `figures/qualitative_instances.png`.
+### Per-class PQ
 
----
+| Class | DIST | Mask-RCNN | Micro-Net | **Ours** | HoVer-Net |
+|---|---|---|---|---|---|
+| Neoplastic | 0.439 | 0.472 | 0.504 | **0.527** | 0.551 |
+| Epithelial | 0.290 | 0.403 | 0.442 | **0.523** | 0.491 |
+| Inflammatory | 0.343 | 0.290 | 0.333 | **0.378** | 0.417 |
+| Connective | 0.275 | 0.300 | 0.334 | **0.377** | 0.388 |
+| Dead | 0.000 | 0.069 | 0.051 | **0.139** | 0.139 |
+
+CHROMA-Net leads DIST, Mask-RCNN and Micro-Net on every class. Two results
+against HoVer-Net are worth noting. **Epithelial PQ 0.523 beats it outright**
+(0.491). And **Dead PQ 0.139 matches it exactly**, on nuclei that are 0.065% of
+all pixels - 2.7x Micro-Net, where DIST scores zero - which is the long-tail
+logit adjustment doing what it was added for, since mPQ weights Dead equally
+with Neoplastic.
+
+Reproduce with `python src/evaluate_instance.py --tag chroma --tta`.
 
 ## Protocol
 

@@ -44,8 +44,14 @@ RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
 BINARY_MODELS = {"cnn": CNNBaseline, "unet": UNet, "attention_unet": AttentionUNet}
 
 # Published results on the same three-fold protocol, for context in the report.
-# Source: LKCell (arXiv 2407.18054) Table 2.
+# The four baselines come from the dataset's own paper, Gamper et al., "PanNuke
+# Dataset Extension, Insights and Baselines" (arXiv 2003.10778) Table III; the
+# later methods from LKCell (arXiv 2407.18054) Table 2, which reports the same
+# HoVer-Net figures and so shares the protocol.
 PUBLISHED = [
+    ("DIST", 0.3406, 0.5346),
+    ("Mask-RCNN", 0.3688, 0.5528),
+    ("Micro-Net", 0.4059, 0.6053),
     ("HoVer-Net (2019)", 0.4629, 0.6596),
     ("StarDist", 0.4796, 0.6692),
     ("CPP-Net", 0.4815, 0.6767),
@@ -53,6 +59,16 @@ PUBLISHED = [
     ("CellViT-SAM-H", 0.4980, 0.6793),
     ("LKCell-L (2024)", 0.5080, 0.6851),
 ]
+
+
+# Per-class PQ for the same baselines, Gamper et al. Table IV. The paper's
+# "Non-Neo Epi" column is PanNuke class 5, Epithelial.
+PUBLISHED_PER_CLASS = {
+    "DIST": [0.439, 0.343, 0.275, 0.000, 0.290],
+    "Mask-RCNN": [0.472, 0.290, 0.300, 0.069, 0.403],
+    "Micro-Net": [0.504, 0.333, 0.334, 0.051, 0.442],
+    "HoVer-Net": [0.551, 0.417, 0.388, 0.139, 0.491],
+}
 
 
 def load_chroma(checkpoint_path, device):
@@ -74,8 +90,9 @@ def load_chroma(checkpoint_path, device):
 
 
 @torch.no_grad()
-def predict_chroma(model, loader, device, use_tta):
+def predict_chroma(model, loader, device, use_tta, decode_params=None):
     """Run CHROMA-Net over a fold and decode instances."""
+    decode_params = decode_params or {}
     inst_maps = []
     type_maps = []
 
@@ -90,7 +107,7 @@ def predict_chroma(model, loader, device, use_tta):
         hv_pred = predictions["hv"].float().cpu().numpy()
         tp_pred = predictions["tp"].float().argmax(dim=1).cpu().numpy().astype(np.uint8)
 
-        pred_inst, pred_type = decode_batch(np_prob, hv_pred, tp_pred)
+        pred_inst, pred_type = decode_batch(np_prob, hv_pred, tp_pred, **decode_params)
         inst_maps.append(pred_inst)
         type_maps.append(pred_type)
 
@@ -136,13 +153,29 @@ def score_fold(pred_inst, pred_type, true_inst, true_type, tissues):
     """Per-image PQ over a whole fold."""
     bpq_list = []
     class_pq_list = []
+    bdq_list = []
+    bsq_list = []
 
     for i in range(len(pred_inst)):
-        bpq, class_pq = pq_per_image(true_inst[i], true_type[i], pred_inst[i], pred_type[i])
+        bpq, class_pq, bdq, bsq = pq_per_image(
+            true_inst[i], true_type[i], pred_inst[i], pred_type[i]
+        )
         bpq_list.append(bpq)
         class_pq_list.append(class_pq)
+        bdq_list.append(bdq)
+        bsq_list.append(bsq)
 
-    return aggregate_pq(bpq_list, class_pq_list, tissues)
+    return aggregate_pq(bpq_list, class_pq_list, tissues, bdq_list, bsq_list)
+
+
+def decode_params(args):
+    """Watershed parameters from the command line, tuned by tune_postprocess.py."""
+    return {
+        "np_threshold": args.np_threshold,
+        "marker_threshold": args.marker_threshold,
+        "min_size": args.min_size,
+        "sobel_ksize": args.sobel_ksize,
+    }
 
 
 def evaluate_split(args, split, device):
@@ -162,7 +195,8 @@ def evaluate_split(args, split, device):
 
         loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
                             num_workers=args.workers, pin_memory=True)
-        pred_inst, pred_type = predict_chroma(model, loader, device, args.tta)
+        pred_inst, pred_type = predict_chroma(model, loader, device, args.tta,
+                                              decode_params(args))
     else:
         pred_inst, pred_type = predict_binary_baseline(
             args.model, fold, args.data_dir, device, split, args.out_dir
@@ -179,6 +213,10 @@ def main():
                         help="run tag used by train_chroma.py")
     parser.add_argument("--splits", type=int, nargs="+", default=[1, 2, 3], choices=[1, 2, 3])
     parser.add_argument("--tta", action="store_true", help="average over the 8 dihedral views")
+    parser.add_argument("--np-threshold", type=float, default=0.5)
+    parser.add_argument("--marker-threshold", type=float, default=0.4)
+    parser.add_argument("--min-size", type=int, default=10)
+    parser.add_argument("--sobel-ksize", type=int, default=21)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--data-dir", type=str, default=DATA_DIR)
@@ -196,7 +234,8 @@ def main():
     per_split = {}
     for split in args.splits:
         per_split[split] = evaluate_split(args, split, device)
-        print(f"    mPQ {per_split[split]['mpq']:.4f}   bPQ {per_split[split]['bpq']:.4f}")
+        print(f"    mPQ {per_split[split]['mpq']:.4f}   bPQ {per_split[split]['bpq']:.4f}"
+              f"   (bDQ {per_split[split]['bdq']:.4f} x bSQ {per_split[split]['bsq']:.4f})")
 
     mpq = float(np.nanmean([r["mpq"] for r in per_split.values()]))
     bpq = float(np.nanmean([r["bpq"] for r in per_split.values()]))
@@ -204,7 +243,15 @@ def main():
     print(f"\n{'=' * 70}")
     print(f"  {name}: averaged over {len(args.splits)} split(s)")
     print(f"{'=' * 70}")
+    bdq = float(np.nanmean([r["bdq"] for r in per_split.values()]))
+    bsq = float(np.nanmean([r["bsq"] for r in per_split.values()]))
+
     print(f"  mPQ: {mpq:.4f}    bPQ: {bpq:.4f}")
+    print(f"  bDQ: {bdq:.4f}    bSQ: {bsq:.4f}")
+    print()
+    print("  bDQ is detection: nuclei missed, invented, merged or split.")
+    print("  bSQ is segmentation: how well matched nuclei overlap.")
+    print("  A weak bDQ points at the watershed decoding, a weak bSQ at the decoder.")
 
     # Per-split detail, then the breakdown from the first split for context.
     print(f"\n  {'Split':<10} {'mPQ':>10} {'bPQ':>10}")
@@ -227,10 +274,16 @@ def main():
         print(f"  {tissue:<18} {row['mpq']:>10.4f} {row['bpq']:>10.4f}")
 
     per_class = np.nanmean(np.stack([r["per_class"] for r in per_split.values()]), axis=0)
-    print(f"\n  {'Class':<18} {'PQ':>10}")
-    print(f"  {'-' * 18} {'-' * 10}")
-    for class_name, value in zip(TYPE_NAMES, per_class):
-        print(f"  {class_name:<18} {value:>10.4f}")
+    print(f"\n  {'Class':<16}" + "".join(f"{m:>12}" for m in PUBLISHED_PER_CLASS) + f"{'ours':>12}")
+    print(f"  {'-' * 16}" + f"{'-' * 12}" * (len(PUBLISHED_PER_CLASS) + 1))
+    for i, class_name in enumerate(TYPE_NAMES):
+        row = f"  {class_name:<16}"
+        for values in PUBLISHED_PER_CLASS.values():
+            row += f"{values[i]:>12.3f}"
+        best_published = max(v[i] for v in PUBLISHED_PER_CLASS.values())
+        marker = " *" if per_class[i] > best_published else ""
+        print(row + f"{per_class[i]:>12.3f}{marker}")
+    print("\n  * beats every published baseline on that class")
 
     print(f"\n{'=' * 70}")
     print("  Published results on the same protocol")
@@ -248,8 +301,11 @@ def main():
         "tag": args.tag,
         "tta": args.tta,
         "splits": args.splits,
+        "decode_params": decode_params(args),
         "mpq": mpq,
         "bpq": bpq,
+        "bdq": bdq,
+        "bsq": bsq,
         "per_split": {
             str(split): {"mpq": results["mpq"], "bpq": results["bpq"]}
             for split, results in per_split.items()

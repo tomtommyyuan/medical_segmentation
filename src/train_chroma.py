@@ -248,7 +248,9 @@ def validate(model, loader, criterion, device, args, max_patches=VAL_SUBSET):
         for i in range(len(pred_inst)):
             if scored >= max_patches:
                 break
-            bpq, class_pq = pq_per_image(true_inst[i], true_type[i], pred_inst[i], pred_type[i])
+            bpq, class_pq, _, _ = pq_per_image(
+                true_inst[i], true_type[i], pred_inst[i], pred_type[i]
+            )
             bpq_list.append(bpq)
             class_pq_list.append(class_pq)
             tissues.append(TISSUE_TYPES[int(batch["tissue"][i])])

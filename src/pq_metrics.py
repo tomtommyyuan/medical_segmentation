@@ -125,11 +125,20 @@ def pq_per_image(true_inst, true_type, pred_inst, pred_type, num_types=NUM_TYPES
         bpq: float, binary PQ
         class_pq: (num_types,) float array, NaN where the class is absent from
                   both ground truth and prediction
+        bdq: float, binary detection quality (F1 over matched instances)
+        bsq: float, binary segmentation quality (mean IoU of those matches)
+
+    bdq and bsq factorise bpq, and the split says which half of the pipeline is
+    weak: low bdq means nuclei are missed, hallucinated, merged or split, and
+    points at the watershed decoding; low bsq means the matches are found but
+    their boundaries are loose, and points at the decoder's resolution. The two
+    have different remedies, so reporting only their product hides which one
+    applies.
     """
     true_inst = remap_label(true_inst)
     pred_inst = remap_label(pred_inst)
 
-    bpq = get_fast_pq(true_inst, pred_inst)[0][2]
+    bdq, bsq, bpq = get_fast_pq(true_inst, pred_inst)[0]
 
     class_pq = np.full(num_types, np.nan, dtype=np.float64)
 
@@ -147,7 +156,7 @@ def pq_per_image(true_inst, true_type, pred_inst, pred_type, num_types=NUM_TYPES
         else:
             class_pq[t - 1] = get_fast_pq(true_t, pred_t)[0][2]
 
-    return bpq, class_pq
+    return bpq, class_pq, bdq, bsq
 
 
 def _safe_nanmean(values):
@@ -158,7 +167,7 @@ def _safe_nanmean(values):
     return float(np.nanmean(values))
 
 
-def aggregate_pq(bpq_list, class_pq_list, tissues):
+def aggregate_pq(bpq_list, class_pq_list, tissues, bdq_list=None, bsq_list=None):
     """
     Aggregate per-image PQ into the PanNuke headline numbers.
 
@@ -169,6 +178,8 @@ def aggregate_pq(bpq_list, class_pq_list, tissues):
         bpq_list: (N,) per-image binary PQ
         class_pq_list: (N, num_types) per-image per-class PQ, may contain NaN
         tissues: (N,) tissue type string per image
+        bdq_list: (N,) per-image binary detection quality, optional
+        bsq_list: (N,) per-image binary segmentation quality, optional
 
     Returns:
         dict with keys:
@@ -184,18 +195,26 @@ def aggregate_pq(bpq_list, class_pq_list, tissues):
 
     mpq_per_image = np.array([_safe_nanmean(row) for row in class_pq_arr])
 
+    bdq_per_image = np.asarray(bdq_list, dtype=np.float64) if bdq_list is not None else None
+    bsq_per_image = np.asarray(bsq_list, dtype=np.float64) if bsq_list is not None else None
+
     per_tissue = {}
     for tissue in sorted(set(tissues.tolist())):
         idx = tissues == tissue
-        per_tissue[tissue] = {
+        row = {
             "mpq": _safe_nanmean(mpq_per_image[idx]),
             "bpq": _safe_nanmean(bpq_per_image[idx]),
             "n": int(idx.sum()),
         }
+        if bdq_per_image is not None:
+            row["bdq"] = _safe_nanmean(bdq_per_image[idx])
+        if bsq_per_image is not None:
+            row["bsq"] = _safe_nanmean(bsq_per_image[idx])
+        per_tissue[tissue] = row
 
     per_class = np.array([_safe_nanmean(class_pq_arr[:, t]) for t in range(class_pq_arr.shape[1])])
 
-    return {
+    results = {
         "mpq": _safe_nanmean([v["mpq"] for v in per_tissue.values()]),
         "bpq": _safe_nanmean([v["bpq"] for v in per_tissue.values()]),
         "per_tissue": per_tissue,
@@ -203,6 +222,16 @@ def aggregate_pq(bpq_list, class_pq_list, tissues):
         "mpq_per_image": mpq_per_image,
         "bpq_per_image": bpq_per_image,
     }
+
+    # Averaged over tissues the same way as bPQ, so the three are comparable.
+    # Note bdq * bsq only approximates bpq here: each is averaged separately,
+    # and a mean of products is not the product of means.
+    if bdq_per_image is not None:
+        results["bdq"] = _safe_nanmean([v["bdq"] for v in per_tissue.values()])
+    if bsq_per_image is not None:
+        results["bsq"] = _safe_nanmean([v["bsq"] for v in per_tissue.values()])
+
+    return results
 
 
 def print_pq_report(name, results, type_names=TYPE_NAMES):

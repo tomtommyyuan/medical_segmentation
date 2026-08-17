@@ -29,24 +29,28 @@ Official PanNuke three-fold protocol, averaged over the three splits.
 | Micro-Net | 0.4059 | 0.6053 |
 | **CHROMA-Net (ours)** | **0.4340** | **0.6146** |
 | **CHROMA-Net + TTA (ours)** | **0.4456** | **0.6228** |
+| HoVer-Net (2019) | 0.4629 | 0.6596 |
 
-CHROMA-Net exceeds DIST, Mask-RCNN and Micro-Net on both metrics. Baseline
-figures are from the dataset's own paper, Gamper et al. 2020, Table III.
+CHROMA-Net exceeds DIST, Mask-RCNN and Micro-Net on both metrics and approaches
+HoVer-Net. All four baseline figures are from the dataset's own paper, Gamper
+et al. 2020, Table III.
 
 ### Per-class PQ
 
-| Class | DIST | Mask-RCNN | Micro-Net | **Ours** |
-|---|---|---|---|---|
-| Neoplastic | 0.439 | 0.472 | 0.504 | **0.527** |
-| Epithelial | 0.290 | 0.403 | 0.442 | **0.523** |
-| Inflammatory | 0.343 | 0.290 | 0.333 | **0.378** |
-| Connective | 0.275 | 0.300 | 0.334 | **0.377** |
-| Dead | 0.000 | 0.069 | 0.051 | **0.139** |
+| Class | DIST | Mask-RCNN | Micro-Net | **Ours** | HoVer-Net |
+|---|---|---|---|---|---|
+| Neoplastic | 0.439 | 0.472 | 0.504 | **0.527** | 0.551 |
+| Epithelial | 0.290 | 0.403 | 0.442 | **0.523** | 0.491 |
+| Inflammatory | 0.343 | 0.290 | 0.333 | **0.378** | 0.417 |
+| Connective | 0.275 | 0.300 | 0.334 | **0.377** | 0.388 |
+| Dead | 0.000 | 0.069 | 0.051 | **0.139** | 0.139 |
 
-CHROMA-Net leads every class. **Dead** is the one to look at: 0.139 against
-Micro-Net's 0.051 and DIST's 0.000, on nuclei that are 0.065% of all pixels but
-which mPQ weights equally with Neoplastic. That is the long-tail logit
-adjustment doing what it was added for.
+CHROMA-Net leads DIST, Mask-RCNN and Micro-Net on every class. Two results
+against HoVer-Net are worth noting. **Epithelial PQ 0.523 beats it outright**
+(0.491). And **Dead PQ 0.139 matches it exactly**, on nuclei that are 0.065% of
+all pixels - 2.7x Micro-Net, where DIST scores zero - which is the long-tail
+logit adjustment doing what it was added for, since mPQ weights Dead equally
+with Neoplastic.
 
 Reproduce with `python src/evaluate_instance.py --tag chroma --tta`.
 

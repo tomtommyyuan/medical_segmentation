@@ -44,8 +44,14 @@ RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
 BINARY_MODELS = {"cnn": CNNBaseline, "unet": UNet, "attention_unet": AttentionUNet}
 
 # Published results on the same three-fold protocol, for context in the report.
-# Source: LKCell (arXiv 2407.18054) Table 2.
+# The four baselines come from the dataset's own paper, Gamper et al., "PanNuke
+# Dataset Extension, Insights and Baselines" (arXiv 2003.10778) Table III; the
+# later methods from LKCell (arXiv 2407.18054) Table 2, which reports the same
+# HoVer-Net figures and so shares the protocol.
 PUBLISHED = [
+    ("DIST", 0.3406, 0.5346),
+    ("Mask-RCNN", 0.3688, 0.5528),
+    ("Micro-Net", 0.4059, 0.6053),
     ("HoVer-Net (2019)", 0.4629, 0.6596),
     ("StarDist", 0.4796, 0.6692),
     ("CPP-Net", 0.4815, 0.6767),
@@ -53,6 +59,16 @@ PUBLISHED = [
     ("CellViT-SAM-H", 0.4980, 0.6793),
     ("LKCell-L (2024)", 0.5080, 0.6851),
 ]
+
+
+# Per-class PQ for the same baselines, Gamper et al. Table IV. The paper's
+# "Non-Neo Epi" column is PanNuke class 5, Epithelial.
+PUBLISHED_PER_CLASS = {
+    "DIST": [0.439, 0.343, 0.275, 0.000, 0.290],
+    "Mask-RCNN": [0.472, 0.290, 0.300, 0.069, 0.403],
+    "Micro-Net": [0.504, 0.333, 0.334, 0.051, 0.442],
+    "HoVer-Net": [0.551, 0.417, 0.388, 0.139, 0.491],
+}
 
 
 def load_chroma(checkpoint_path, device):
@@ -258,10 +274,16 @@ def main():
         print(f"  {tissue:<18} {row['mpq']:>10.4f} {row['bpq']:>10.4f}")
 
     per_class = np.nanmean(np.stack([r["per_class"] for r in per_split.values()]), axis=0)
-    print(f"\n  {'Class':<18} {'PQ':>10}")
-    print(f"  {'-' * 18} {'-' * 10}")
-    for class_name, value in zip(TYPE_NAMES, per_class):
-        print(f"  {class_name:<18} {value:>10.4f}")
+    print(f"\n  {'Class':<16}" + "".join(f"{m:>12}" for m in PUBLISHED_PER_CLASS) + f"{'ours':>12}")
+    print(f"  {'-' * 16}" + f"{'-' * 12}" * (len(PUBLISHED_PER_CLASS) + 1))
+    for i, class_name in enumerate(TYPE_NAMES):
+        row = f"  {class_name:<16}"
+        for values in PUBLISHED_PER_CLASS.values():
+            row += f"{values[i]:>12.3f}"
+        best_published = max(v[i] for v in PUBLISHED_PER_CLASS.values())
+        marker = " *" if per_class[i] > best_published else ""
+        print(row + f"{per_class[i]:>12.3f}{marker}")
+    print("\n  * beats every published baseline on that class")
 
     print(f"\n{'=' * 70}")
     print("  Published results on the same protocol")

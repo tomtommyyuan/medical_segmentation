@@ -157,7 +157,7 @@ def test_end_to_end_perfect_prediction_scores_pq_one():
         np_map[None], hv_map[None], type_map[None].astype(np.uint8)
     )
 
-    bpq, class_pq = pq_per_image(inst, type_map, inst_pred[0], type_pred[0])
+    bpq, class_pq, _, _ = pq_per_image(inst, type_map, inst_pred[0], type_pred[0])
 
     assert bpq > 0.95, f"binary PQ {bpq:.4f}"
     present = ~np.isnan(class_pq)

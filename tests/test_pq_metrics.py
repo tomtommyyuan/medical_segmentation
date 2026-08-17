@@ -147,10 +147,46 @@ def test_pq_per_image_survives_a_full_coverage_prediction():
     pred_inst = np.ones((32, 32), dtype=np.int32)
     pred_type = np.ones((32, 32), dtype=np.uint8)
 
-    bpq, class_pq = pq_per_image(true_inst, true_type, pred_inst, pred_type)
+    bpq, class_pq, bdq, bsq = pq_per_image(true_inst, true_type, pred_inst, pred_type)
 
     assert np.isfinite(bpq)
     assert np.isfinite(class_pq[0])
+
+
+def test_pq_per_image_reports_the_detection_and_segmentation_factors():
+    # bDQ x bSQ must reconstruct bPQ for a single image; the two only diverge
+    # from their product once averaged across images.
+    true = np.zeros((64, 64), dtype=np.int32)
+    square(true, 10, 20, 10, 20, 1)
+    square(true, 40, 50, 40, 50, 2)
+
+    pred = np.zeros((64, 64), dtype=np.int32)
+    square(pred, 10, 20, 12, 22, 1)   # offset, so SQ < 1
+    square(pred, 40, 50, 40, 50, 2)   # exact
+
+    _, _, bdq, bsq = pq_per_image(true, np.zeros_like(true, dtype=np.uint8),
+                                  pred, np.zeros_like(pred, dtype=np.uint8))
+    bpq = pq_per_image(true, np.zeros_like(true, dtype=np.uint8),
+                       pred, np.zeros_like(pred, dtype=np.uint8))[0]
+
+    assert np.isclose(bdq * bsq, bpq, atol=1e-6)
+    assert np.isclose(bdq, 1.0, atol=1e-5), "both nuclei matched, so DQ is 1"
+    assert bsq < 1.0, "one match is offset, so SQ must be below 1"
+
+
+def test_aggregate_reports_detection_and_segmentation_when_given_them():
+    results = aggregate_pq([0.5, 0.7], [[0.5, np.nan, np.nan, np.nan, np.nan],
+                                        [0.7, np.nan, np.nan, np.nan, np.nan]],
+                           ["Breast", "Breast"], [0.8, 0.9], [0.62, 0.78])
+
+    assert np.isclose(results["bdq"], 0.85, atol=1e-6)
+    assert np.isclose(results["bsq"], 0.70, atol=1e-6)
+
+
+def test_aggregate_omits_the_factors_when_not_given_them():
+    results = aggregate_pq([0.5], [[0.5, np.nan, np.nan, np.nan, np.nan]], ["Breast"])
+
+    assert "bdq" not in results and "bsq" not in results
 
 
 def test_class_absent_from_both_is_nan_not_zero():
@@ -159,7 +195,7 @@ def test_class_absent_from_both_is_nan_not_zero():
     square(true_inst, 10, 20, 10, 20, 1)
     square(true_type, 10, 20, 10, 20, 1)  # Neoplastic only
 
-    bpq, class_pq = pq_per_image(true_inst, true_type, true_inst.copy(), true_type.copy())
+    bpq, class_pq, bdq, bsq = pq_per_image(true_inst, true_type, true_inst.copy(), true_type.copy())
 
     assert np.isclose(bpq, 1.0, atol=1e-5)
     assert np.isclose(class_pq[0], 1.0, atol=1e-5)
@@ -178,7 +214,7 @@ def test_class_present_in_only_one_map_scores_zero():
     pred_type = np.zeros((64, 64), dtype=np.uint8)
     square(pred_type, 10, 20, 10, 20, 2)
 
-    bpq, class_pq = pq_per_image(true_inst, true_type, pred_inst, pred_type)
+    bpq, class_pq, bdq, bsq = pq_per_image(true_inst, true_type, pred_inst, pred_type)
 
     assert np.isclose(bpq, 1.0, atol=1e-5)
     assert np.isclose(class_pq[0], 0.0, atol=1e-5)
